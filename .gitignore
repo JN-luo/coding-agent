@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 凭据（规则 4：绝不入库）
+.env
+.env.*
+config.local.*
+*.local
+
+.claude/
+.pytest_tmp/
