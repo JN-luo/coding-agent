@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -83,12 +84,13 @@ DENIED_COMMAND_WORDS = {
 # 前缀白名单：命中即 allow，比黑名单更具体（`npm test` 允许，`npm install` 仍拒）。
 ALLOWED_COMMAND_PREFIXES = (
     "python",
+    "pytest",
     "npm test",
     "cargo test",
     "go test",
 )
 
-SHELL_METACHARS = ("&&", "||", ";", "|", ">", "<", "`", "$(", "\n", "\r")
+SHELL_METACHARS = ("&&", "||", ";", "|", ">", "<", "`", "$(")  # 引号外的操作符；\n/\r 在 check_command_policy 单独处理
 
 
 def run_tool(name: str, args: dict, workspace: Path) -> ToolResult:
@@ -127,7 +129,12 @@ def check_command_policy(command: str) -> str:
     if not isinstance(command, str) or command.strip() == "":
         return "deny"
 
-    if any(meta in command for meta in SHELL_METACHARS):
+    # 换行始终拒绝（多行命令注入）
+    if "\n" in command or "\r" in command:
+        return "deny"
+
+    # 引号外的 shell 操作符才算元字符；引号内是字符串内容
+    if _has_unquoted_metachar(command):
         return "deny"
 
     try:
@@ -154,6 +161,37 @@ def _matches_allow_prefix(normalized: str) -> bool:
     for prefix in ALLOWED_COMMAND_PREFIXES:
         if normalized == prefix or normalized.startswith(prefix + " "):
             return True
+    return False
+
+
+def _has_unquoted_metachar(command: str) -> bool:
+    """检查 shell 操作符是否出现在引号外（引号内是字符串内容，不算元字符）。"""
+    in_quote = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+            i += 1
+            continue
+        for meta in SHELL_METACHARS:
+            if command.startswith(meta, i):
+                return True
+        i += 1
     return False
 
 
@@ -283,6 +321,10 @@ def _run_command(args: dict, workspace: Path) -> ToolResult:
         parts = shlex.split(command, posix=True)
     except ValueError as exc:
         raise ToolError("InvalidArgs", f"invalid command: {exc}") from exc
+
+    # 让 `python ...` 用 agent 自己的解释器（含 pytest），避免 PATH 解析到无 pytest 的 Python
+    if parts and parts[0].lower() in ("python", "python.exe"):
+        parts[0] = sys.executable
 
     try:
         completed = subprocess.run(

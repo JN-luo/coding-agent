@@ -251,6 +251,18 @@ def test_policy_denies_metachar():
     assert check_command_policy("python -m pytest && rm -rf /") == "deny"
 
 
+def test_policy_allows_quoted_semicolon():
+    assert check_command_policy('python -c "a;b"') == "allow"
+
+
+def test_policy_denies_unquoted_semicolon():
+    assert check_command_policy("python -m pytest; rm -rf /") == "deny"
+
+
+def test_policy_allows_pytest():
+    assert check_command_policy("pytest test_calculator.py -v") == "allow"
+
+
 def test_policy_denies_unknown():
     assert check_command_policy("git status") == "deny"
 
@@ -259,6 +271,13 @@ def test_run_command_allowed(tmp_path):
     result = run_tool("run_command", {"command": "python --version"}, tmp_path)
     assert result.ok is True
     assert "Python" in result.output
+
+
+def test_run_command_python_uses_sys_executable(tmp_path):
+    import sys
+    result = run_tool("run_command", {"command": "python -c \"print(__import__('sys').executable)\""}, tmp_path)
+    assert result.ok is True
+    assert result.output.strip() == sys.executable
 
 
 def test_run_command_denied(tmp_path):

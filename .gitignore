@@ -1,19 +1,16 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-
-# 虚拟环境
-.venv/
-venv/
-
-# 凭据（规则 4：绝不入库）
+# 凭据与本地配置（不入库，见 DESIGN.md §10.3）
 .env
 .env.*
 config.local.*
-*.local
 
+# 调试轨迹
+trace/
+demo/
 .claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
 .pytest_tmp/

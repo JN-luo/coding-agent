@@ -21,24 +21,58 @@
 
 ## 3. 模块划分
 
+### 会话架构（Session / Conversation / Trace）
+
+核心版本只做**持续交互**，不做恢复 / 回放。目标是「一个进程里像 Claude Code 一样一直聊下去」：
+
+- **Session**（`session.py`）：REPL 运行时容器。持有 workspace、llm、Conversation、Trace、历史 Report。一个 `python -m agent` 进程对应一个 Session，直到退出为止。
+- **Conversation**（`messages.py`）：真正发给模型的持续上下文。它是活的、内存中的对话序列，跨任务累积，但不落盘、不负责恢复。
+- **Trace**（`trace.py`）：仅作调试日志。append-only，方便看每一步发生了什么，但**不参与控制流，不作为恢复源**。
+
+```text
+CLI / REPL
+  -> Session（进程内长期存在）
+      -> Conversation（持续上下文）
+      -> loop step（单任务 Observe→Think→Act→Observe）
+      -> Trace（可选日志）
+```
+
+原则：
+
+1. **单任务状态与跨任务状态分离**：parse / safety / same_tool / max_steps 每任务重置；conversation / workspace 跨任务连续；trace 只是日志。
+2. **Conversation 是唯一的活上下文**：它只负责给模型看的消息序列，不负责调度。
+3. **context 从 Conversation 取数**：新任务时从 session.conversation 构建 prompt，保留系统提示词、历史任务、工具结果与压缩摘要。
+4. **Report 是每任务输出**：Session 聚合多个 Report，但不把 Report 当作状态源。
+
 建议仓库结构：
 
 ```text
 coding-agent/
   agent/
     __init__.py
+    __main__.py
     cli.py
+    session.py
     loop.py
     llm.py
     messages.py
+    trace.py
     tools.py
+    prompts.py
     context.py
     parser.py
     config.py
   tests/
     test_parser.py
     test_tools.py
+    test_messages.py
+    test_trace.py
     test_context.py
+    test_prompts.py
+    test_config.py
+    test_llm.py
+    test_loop.py
+    test_session.py
   README.txt
   DESIGN.md
   .gitignore
@@ -46,48 +80,57 @@ coding-agent/
 
 ### `cli.py`
 
-负责命令行入口：
+REPL 外壳，维护一个长期 session：
 
 ```bash
-python -m agent "修复测试失败"
-python -m agent --workspace ./demo "给项目加一个 argparse 参数"
+python -m agent "任务"                    # one-shot：单任务 session，跑完即退
+python -m agent                           # 无任务 → 进 REPL，长期 session
+python -m agent --workspace ./demo ...    # workspace 缺省为当前目录 Path.cwd()
 ```
 
-它只处理参数、加载配置、启动 loop，不放复杂逻辑。
+它只做参数解析、`config.load_config`、构造 `Session`、REPL 循环（`input` 读任务、`session.submit`、打印 Report），不放复杂逻辑。退出时打印 session 级汇总。
 
 ### `loop.py`
 
-核心调度器，维护 agent 状态：
+单任务执行器（`Observe -> Think -> Act -> Observe`），由 Session 驱动。它只负责完成一个 task 的推理闭环，不保存跨任务状态。
 
-- 当前任务
-- 消息历史
-- 已执行步骤数
-- 最近工具结果
-- 错误计数
-- token 或字符预算
-- 是否完成
-
-伪代码：
+单任务状态（每任务重置）：step、连续解析失败、连续同类工具失败、安全拒绝计数。伪代码：
 
 ```python
-while step < max_steps:
-    prompt = context.build(task, history, workspace_summary)
-    raw = llm.complete(prompt, tool_schema)
-    action = parser.parse(raw)
+def run_task(session, task) -> Report:
+    session.trace.log("task", text=task)
+    while step < max_steps:
+        messages = context.build(session.conversation, task)
+        raw = session.llm.complete(messages)
+        session.trace.log("llm_raw", text=raw)
+        action = parser.parse(raw)
 
-    if action.type == "final":
-        return action.message
+        if action.action == "final":
+            session.trace.log("stop", reason="final")
+            return report(done=True, ...)
 
-    result = tools.run(action)
-    history.append(action, result)
+        result = run_tool(action.action, action.args, session.workspace)
+        session.conversation.append_turn(action.action, action.args, result)
+        session.trace.log("tool", tool=action.action, ok=result.ok, error=result.error)
 
-    if should_stop(history, result):
-        return summarize_result(history)
+        if should_stop(...):
+            session.trace.log("stop", reason=...)
+            return report(...)
 ```
+
+### `session.py`
+
+跨任务状态与编排的核心对象：
+
+- 持有 `Conversation`、`Trace`、`workspace`、`llm`、`reports: list[Report]`。
+- `submit(task) -> Report`：把新 task 交给 loop 跑完，然后把结果写回 conversation + trace，保存 Report。
+- 支撑 REPL：一个 session 跑到底，直到用户退出才销毁 conversation。
+
+这是「像 Claude Code 连续感」的落点：单任务计数归 loop，跨任务连续性归 Session。
 
 ### `llm.py`
 
-只封装模型调用。允许使用模型厂商 API 客户端，但不依赖托管代码执行、文件工具或 agent SDK。
+只封装模型调用，提供 `complete(messages) -> str`（主对话，吃 conversation 消息）与 `summarize(turns) -> str`（语义压缩，turns 由 context 从 conversation 提取）。允许使用模型厂商 API 客户端，但不依赖托管代码执行、文件工具或 agent SDK；HTTP 用标准库 `urllib`。
 
 配置来源：
 
@@ -166,54 +209,80 @@ TOOLS: dict[str, Tool] = {}   # 注册表；喂给模型的工具说明由这里
 安全约束（作为本文件的 helper，替代原 `sandbox.py`）：
 
 - `resolve_in_workspace(path, workspace)`：resolve 后必须落在 workspace 内，越权抛 `PathOutsideWorkspace`。
-- `check_command_policy(command)`：先拒 shell 元字符（`;` / `&&` / `|` / 反引号 / `$(`），再命中前缀白名单（`python` / `npm test` / `cargo test` / `go test`），未命中白名单则落回黑名单（`rm` / `del` / `pip install` …）拒绝，最终默认拒绝。MVP 只做 allow / deny。
+- `check_command_policy(command)`：先拒引号外的 shell 操作符（`;` / `&&` / `|` / 反引号 / `$(`，引号内是字符串内容不算），再命中前缀白名单（`python` / `pytest` / `npm test` / `cargo test` / `go test`），未命中白名单则落回黑名单（`rm` / `del` / `pip install` …）拒绝，最终默认拒绝。MVP 只做 allow / deny。
 - 凭据保护：`read_file` / `write_file` 拒绝访问 `.env`、私钥（`id_rsa` / `*.pem` / `*.key`）；`grep` 静默跳过这些文件。
 - 跨平台：命令执行用 `subprocess.run(shell=False)`（配 `shlex.split` 拆词，安全边界由白名单策略承担）；路径用 `pathlib`。开发环境为 Windows，6 个工具须在 Windows 本机跑通才算 MVP 完成。
 
+### `prompts.py`
+
+系统提示词单独放在这里，负责输出协议、工具白名单、workspace / 安全边界和失败恢复规则。
+`context.py` 只负责从 conversation 装配消息（系统提示词 + 各任务 + 轨迹），超阈值时触发语义压缩。
+
 ### `context.py`
 
-上下文管理是面试重点。三层上下文 + 压缩，**压缩是核心自研项，不是可选增强**：
+上下文管理是面试重点。三层上下文 + 语义压缩，**压缩是核心自研项，不是可选增强**：
 
 1. **固定系统规则**：agent 能做什么、不能做什么、工具 JSON 格式。
-2. **工作区摘要**：项目语言、主要文件、最近读过的文件摘要。
+2. **工作区摘要**：项目语言、主要文件、最近读过的文件摘要——由 conversation 里的历史观察（list_files/read_file）自然体现，不单独计算。
 3. **短期轨迹**：最近 N 轮 action/result 原文。
 
-当历史超过阈值（字符数或轮数）时，在 core 里触发压缩，不直接丢弃全部内容，而是把旧轨迹压缩为：
+输入从「裸 turns」改为 **conversation**：新任务时从 `session.conversation.turns` 提取活跃轨迹（system + 各任务 + 轨迹），超阈值时把旧轨迹交给语义 summarizer 压缩，保留未完成事项和关键结论。`context.py` 只负责从 conversation 装配和触发压缩，不做规则摘要。
 
-```text
-已完成：
-- 读取了 pyproject.toml，确认项目使用 pytest
-- 修改了 agent/parser.py，增加 JSON 代码块解析
-
-仍需：
-- 运行测试
-- 如果失败，修复 parser 边界情况
-```
-
-压缩必须保证"不丢失未完成事项与关键结论"，并配 `test_context.py` 验证压缩前后信息保留。
+语义 summarizer 由 `llm.summarize` 提供；`test_context.py` 用 fake summarizer 验证接口形状与信息保留。
 
 ### `messages.py`
 
-维护发给模型的消息列表（system + user + assistant + tool 结果），负责把 action/result 转成下一轮的 assistant/tool 消息，是"对话历史管理"的落点。
+conversation 核心，三件套：`Message(role, content)` + `Turn(action, args, result)` + `Conversation`。`Conversation` 同时持有 `messages`（发给模型的序列）与 `turns`（结构化轨迹，供 context 压缩），是**活上下文**，跨任务累积，不落盘、不恢复。
+
+- `system`：固定规则 + 工具 schema（由 `prompts.py` 构建，进程开头写一次）。
+- `user`：每轮任务（每个 task 一条）+ 每轮的观察结果。
+- `assistant`：模型当轮动作的 canonical JSON（由 parsed action 重渲染，丢 thought）。
+
+接口：`set_system(rules)`、`add_task(text)`、`append_turn(action, args, result)`（追加 assistant 动作 + user 观察 + 一条 Turn，保证交替）、`add_final(message)`（追加 final 结论，供下个任务参考）、`as_openai()`、`total_chars()`。观察 JSON 对齐 §6——成功 `{"tool", "ok", "output"}`、失败 `{"tool", "ok", "error_type", "message"}`。
+
+### `trace.py`
+
+落盘的调试日志，只做观察，不参与控制流：
+
+- 每行一个事件，`flush()` 每行，崩溃时尽量保住已写行。
+- 关键事件：`llm_raw`、`action`、`parse_error`、`tool`、`stop`、`task`。
+- 文件按 session 命名 `run-<时间戳>.jsonl`，目录由 `CODING_AGENT_TRACE_DIR` 配置（默认 `trace/`），加入 `.gitignore`。
+- 只做 append-only 日志，不做 replay / resume / 恢复。
 
 ## 4. 推荐的 Prompt 协议
 
-系统提示词核心内容：
+系统提示词（`prompts.py` 生成，工具列表与 schema 由代码生成）：
 
 ```text
-你是一个本地 coding agent。你只能通过工具观察和修改仓库。
-每次回复必须是一个 JSON 对象。
-如果任务完成，使用 action=final。
-不要编造文件内容；需要信息时先 read_file 或 grep。
-写文件前尽量先读取目标文件。
-执行命令失败时，先根据 stderr 分析，再决定下一步。
+你是一个本地 coding agent，在 workspace 目录内观察、修改代码，并运行测试验证。
+
+【输出格式】每次回复必须且只能是一个 JSON 对象，不要输出任何其他文字或 Markdown：
+  - 调用工具：{"thought": "简短说明", "action": "工具名", "args": {...}}
+  - 完成任务：{"action": "final", "message": "总结"}
+action 只能是「可用工具」之一，或 final。
+
+【工具结果】工具执行后回填一个 JSON 观察结果，含 ok 字段：
+  - ok=true 时看 output；
+  - ok=false 时看 error_type 与 message，据此换路径 / 改命令 / 重试，不要原样重来。
+
+【路径】所有 path 都相对 workspace 根目录，不能访问 workspace 之外。
+
+【原则】
+  - 不要编造文件内容；需要信息时先 read_file / grep / glob。
+  - 写文件前尽量先读取目标文件。
+  - 执行命令失败时先分析 stderr。
+  - 任务完成后用 final 收尾，不要无限循环。
+
+【示例】
+  调用工具：{"thought": "先看看项目结构", "action": "list_files", "args": {"path": "."}}
+  完成任务：{"action": "final", "message": "已修复测试失败。"}
 ```
 
-工具 schema 由代码生成，而不是手写散落在 prompt 中，避免实现和说明不一致。
+工具列表与 schema 由代码生成（`prompts.py` 的 `build_system_prompt` 从 `TOOLS` 派生），避免实现和说明不一致。
 
 ## 5. 循环终止条件
 
-至少实现以下终止条件：
+以下终止条件都是**单任务内**的（每任务重置；Session 跨任务存在）：
 
 - `final` 动作：模型主动完成。
 - `max_steps`：默认 20 或 30 步。
@@ -223,6 +292,7 @@ TOOLS: dict[str, Tool] = {}   # 注册表；喂给模型的工具说明由这里
 
 终止时输出简洁报告：
 
+- 终止原因（`stop_reason`：final / max_steps / parse_failures / same_tool_failures / safety_rejections / llm_error）
 - 做了什么
 - 修改了哪些文件
 - 是否运行测试
@@ -246,16 +316,17 @@ TOOLS: dict[str, Tool] = {}   # 注册表；喂给模型的工具说明由这里
 
 ## 7. 最小可行版本
 
-第一阶段只做命令行单 agent：
+第一阶段做命令行持续交互 agent（`python -m agent` 进入 REPL，`python -m agent "任务"` 仍保留 one-shot）：
 
-1. CLI 接收任务。
-2. LLM 返回 JSON 动作。
-3. 支持 `list_files`、`read_file`、`glob`、`grep`、`write_file`、`run_command`（6 个）。
-4. 路径限制在 workspace 内（含 Windows 兼容）。
-5. 最多运行 20 步。
-6. 历史超阈值触发压缩（§3 三层上下文 + 压缩，核心项）。
-7. 危险命令直接拒绝并回填错误。
-8. 最终输出任务报告。
+1. CLI/REPL 接收任务。
+2. `Session` 维持一个长期 `Conversation`。
+3. LLM 返回 JSON 动作。
+4. 支持 `list_files`、`read_file`、`glob`、`grep`、`write_file`、`run_command`（6 个）。
+5. 路径限制在 workspace 内（含 Windows 兼容）。
+6. 每个 task 最多运行 20 步。
+7. 历史超阈值触发语义压缩（§3 三层上下文 + summarizer）。
+8. 危险命令直接拒绝并回填错误。
+9. 每个 task 输出一份 Report，REPL 继续等下一条任务。
 
 这个版本已满足项目要求中的核心逻辑自研：对话历史、上下文、工具定义、本地执行、输出解析、终止条件、错误处理。
 
@@ -263,12 +334,10 @@ TOOLS: dict[str, Tool] = {}   # 注册表；喂给模型的工具说明由这里
 
 按实现成本与面试可解释性排序：
 
-1. **变更报告**：结束时列出 modified files 和测试命令（成本最低，先做）。
-2. **Dry run 模式**：只展示计划和将要调用的工具，不真正写文件。
-3. **命令 ask 分级**：在 allow / deny 之外加 ask，对未知命令要求用户确认。
-4. **apply_patch 差异修改（可选，慎做）**：模型输出 unified diff，runtime 校验后应用。unified diff 的模糊匹配、行号漂移是已知工程坑；若做，建议用成熟 diff 库（如 `unidiff`，非 agent SDK，合规），并放到最后，避免卡进度。
-5. **只读批量**：一轮输出 `{"action": "batch", "actions": [{...}, {...}]}`，只允许低风险只读工具，用于列目录 + 读多文件提速。
-6. **更智能的上下文压缩**：在 §7 的阈值压缩之上，做语义级"已完成/仍需"摘要（core 已含基础版，这里是增强）。
+1. **Dry run 模式**：只展示计划和将要调用的工具，不真正写文件。
+2. **命令 ask 分级**：在 allow / deny 之外加 ask，对未知命令要求用户确认。
+3. **apply_patch 差异修改（可选，慎做）**：模型输出 unified diff，runtime 校验后应用。unified diff 的模糊匹配、行号漂移是已知工程坑；若做，建议用成熟 diff 库（如 `unidiff`，非 agent SDK，合规），并放到最后，避免卡进度。
+4. **只读批量**：一轮输出 `{"action": "batch", "actions": [{...}, {...}]}`，只允许低风险只读工具，用于列目录 + 读多文件提速。
 
 ## 9. 演示任务建议
 
