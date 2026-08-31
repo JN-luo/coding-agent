@@ -22,6 +22,9 @@ class Session:
         max_steps: int = MAX_STEPS,
         recent_turns: int = RECENT_TURNS,
         max_chars: int = MAX_CONTEXT_CHARS,
+        on_step=None,
+        mode="ask",
+        asker=None,
     ):
         self.llm = llm
         self.workspace = workspace
@@ -30,6 +33,9 @@ class Session:
         self.max_steps = max_steps
         self.recent_turns = recent_turns
         self.max_chars = max_chars
+        self.on_step = on_step
+        self.mode = mode
+        self.asker = asker
         self.conversation = Conversation()
         self.reports: list[Report] = []
 

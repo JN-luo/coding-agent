@@ -11,12 +11,14 @@ from dataclasses import dataclass
 from agent.context import build
 from agent.llm import LLMError
 from agent.parser import ParseError, parse
+from agent.policy import decide, grant_key
 from agent.tools import TOOLS, ToolResult
 
-MAX_STEPS = 20
+MAX_STEPS = 50
 MAX_PARSE_FAILURES = 3
 MAX_SAME_TOOL_FAILURES = 3
 MAX_SAFETY_REJECTIONS = 3
+MAX_USER_DENIALS = 2
 
 SAFETY_ERRORS = {"PolicyDenied", "PathOutsideWorkspace"}
 
@@ -38,6 +40,9 @@ class Report:
 
 def run_task(session, task: str) -> Report:
     """完成一个 task 的推理闭环，写回 session.conversation + session.trace。"""
+    task_grants: set[str] = set()
+    task_denies: set[str] = set()
+
     session.trace.log("task", text=task)
     session.conversation.add_task(task)
     start_turns = len(session.conversation.turns)
@@ -47,6 +52,7 @@ def run_task(session, task: str) -> Report:
     same_failures = 0
     last_fp = None
     safety = 0
+    user_denies = 0
 
     while step < session.max_steps:
         step += 1
@@ -63,6 +69,8 @@ def run_task(session, task: str) -> Report:
             parse_failures += 1
             same_failures = 0
             session.trace.log("parse_error", step=step, err=str(exc))
+            if session.on_step:
+                session.on_step("parse_error", step=step, err=str(exc))
             session.conversation.append_turn(
                 "parse_error", {},
                 ToolResult(ok=False, output=f"输出无法解析：{exc}，请重新只输出一个 JSON 对象。", error="ParseError"),
@@ -73,20 +81,28 @@ def run_task(session, task: str) -> Report:
 
         parse_failures = 0
         session.trace.log("action", step=step, action=action.action, args=action.args)
+        if session.on_step:
+            session.on_step("action", step=step, action=action.action, args=action.args)
 
         if action.action == "final":
             session.conversation.add_final(action.message)
             return _report(session, True, action.message, "final", start_turns, step)
 
-        result = session.run_tool_fn(action.action, action.args, session.workspace)
+        result = _execute_action(session, action.action, action.args, task_grants, task_denies)
         session.trace.log("tool", step=step, tool=action.action, ok=result.ok,
                           error=result.error, output_len=len(result.output))
+        if session.on_step:
+            session.on_step("tool", tool=action.action, result=result)
         session.conversation.append_turn(action.action, action.args, result)
 
         if result.ok:
             same_failures = 0
             last_fp = None
         else:
+            if result.error == "UserDenied":
+                user_denies += 1
+                if user_denies >= MAX_USER_DENIALS:
+                    return _report(session, False, "用户拒绝了高风险动作，任务停止。", "user_denied", start_turns, step)
             if result.error in SAFETY_ERRORS:
                 safety += 1
                 if safety >= MAX_SAFETY_REJECTIONS:
@@ -101,6 +117,24 @@ def run_task(session, task: str) -> Report:
 
 
 # ---- 内部 ----
+
+def _execute_action(session, action, args, task_grants, task_denies):
+    """裁决 + 授权 + 执行：allow 直接跑，deny 回填 PolicyDenied，ask 走 y/n 授权。"""
+    decision = decide(session.mode, action)
+    if decision.verdict == "deny":
+        return ToolResult(ok=False, output=decision.reason, error="PolicyDenied")
+    if decision.verdict == "ask":
+        key = grant_key(action, args)
+        if key in task_denies:
+            return ToolResult(ok=False, output="用户已拒绝本任务内该类动作，请不要继续尝试。", error="UserDenied")
+        if key not in task_grants:
+            allowed = bool(session.asker and session.asker(action, args))
+            if not allowed:
+                task_denies.add(key)
+                return ToolResult(ok=False, output="用户拒绝执行该动作，本任务内同类动作将继续拒绝。", error="UserDenied")
+            task_grants.add(key)
+    return session.run_tool_fn(action, args, session.workspace)
+
 
 def _build_messages(session):
     try:
@@ -156,7 +190,7 @@ def render_report(report: Report) -> str:
         lines.append("测试结果：")
         lines.append(report.test_result)
     if report.pending:
-        lines.append("未完成事项：")
+        lines.append("过程中遇到的问题：")
         lines += [f"  - {p}" for p in report.pending]
     return "\n".join(lines)
 

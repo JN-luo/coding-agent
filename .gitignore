@@ -6,6 +6,7 @@ config.local.*
 # 调试轨迹
 trace/
 demo/
+face-checkin-backend/
 .claude/
 
 # Python

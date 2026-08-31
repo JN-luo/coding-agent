@@ -9,6 +9,7 @@ import fnmatch
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -64,6 +65,21 @@ SENSITIVE_SUFFIXES = {
     ".pfx",
 }
 
+IGNORED_NAMES = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+}
+
 DENIED_COMMAND_WORDS = {
     "rm",
     "del",
@@ -85,6 +101,8 @@ DENIED_COMMAND_WORDS = {
 ALLOWED_COMMAND_PREFIXES = (
     "python",
     "pytest",
+    "mvn test",
+    "mvn -q test",
     "npm test",
     "cargo test",
     "go test",
@@ -212,6 +230,19 @@ def _ensure_not_sensitive(path: Path) -> None:
         raise ToolError("PolicyDenied", f"拒绝访问凭据文件: {path.name}")
 
 
+def _ensure_not_ignored(path: Path, workspace: Path) -> None:
+    if _is_ignored_path(path, workspace):
+        raise ToolError("IgnoredPath", f"跳过缓存、依赖或构建目录: {_relative(path, workspace)}")
+
+
+def _is_ignored_path(path: Path, workspace: Path) -> bool:
+    try:
+        rel = path.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return False
+    return any(part.lower() in IGNORED_NAMES for part in rel.parts)
+
+
 def _relative(path: Path, workspace: Path) -> str:
     return path.resolve().relative_to(workspace.resolve()).as_posix()
 
@@ -232,6 +263,8 @@ def _list_files(args: dict, workspace: Path) -> ToolResult:
 
     entries = []
     for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        if _is_ignored_path(child, workspace):
+            continue
         suffix = "/" if child.is_dir() else ""
         entries.append(_relative(child, workspace) + suffix)
     return ToolResult(ok=True, output="\n".join(entries) if entries else "空目录")
@@ -240,6 +273,7 @@ def _list_files(args: dict, workspace: Path) -> ToolResult:
 def _read_file(args: dict, workspace: Path) -> ToolResult:
     target = resolve_in_workspace(_require_string(args, "path"), workspace)
     _ensure_not_sensitive(target)
+    _ensure_not_ignored(target, workspace)
     if not target.exists():
         raise ToolError("FileNotFound", f"file not found: {args.get('path')}")
     if not target.is_file():
@@ -258,6 +292,7 @@ def _read_file(args: dict, workspace: Path) -> ToolResult:
 def _write_file(args: dict, workspace: Path) -> ToolResult:
     target = resolve_in_workspace(_require_string(args, "path"), workspace)
     _ensure_not_sensitive(target)
+    _ensure_not_ignored(target, workspace)
     content = args.get("content")
     if not isinstance(content, str):
         raise ToolError("InvalidArgs", "content 必须是字符串")
@@ -274,7 +309,7 @@ def _glob(args: dict, workspace: Path) -> ToolResult:
     matches = []
     for path in workspace.resolve().glob(pattern):
         if path.is_file() or path.is_dir():
-            if _is_sensitive_path(path):
+            if _is_sensitive_path(path) or _is_ignored_path(path, workspace):
                 continue
             suffix = "/" if path.is_dir() else ""
             matches.append(_relative(path, workspace) + suffix)
@@ -291,11 +326,12 @@ def _grep(args: dict, workspace: Path) -> ToolResult:
         raise ToolError("InvalidArgs", f"invalid regex: {exc}") from exc
     if not base.exists():
         raise ToolError("NotFound", f"path not found: {args.get('path', '.')}")
+    _ensure_not_ignored(base, workspace)
 
     files = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]
     lines = []
     for file in files:
-        if _is_sensitive_path(file):
+        if _is_sensitive_path(file) or _is_ignored_path(file, workspace):
             continue
         try:
             text = file.read_text(encoding="utf-8", errors="replace")
@@ -325,6 +361,15 @@ def _run_command(args: dict, workspace: Path) -> ToolResult:
     # 让 `python ...` 用 agent 自己的解释器（含 pytest），避免 PATH 解析到无 pytest 的 Python
     if parts and parts[0].lower() in ("python", "python.exe"):
         parts[0] = sys.executable
+    else:
+        resolved = _resolve_executable(parts[0]) if parts else None
+        if resolved is None:
+            return ToolResult(
+                ok=False,
+                output=f"executable not found: {parts[0]}",
+                error="CommandError",
+            )
+        parts[0] = resolved
 
     try:
         completed = subprocess.run(
@@ -350,6 +395,22 @@ def _run_command(args: dict, workspace: Path) -> ToolResult:
     if completed.returncode != 0:
         return ToolResult(ok=False, output=output, error="CommandFailed")
     return ToolResult(ok=True, output=output)
+
+
+def _resolve_executable(command: str) -> str | None:
+    resolved = shutil.which(command)
+    if resolved is not None:
+        return resolved
+
+    if os.name == "nt":
+        lower = command.lower()
+        if lower == "mvn":
+            for candidate in ("mvn.cmd", "mvn.bat", "mvn.exe"):
+                resolved = shutil.which(candidate)
+                if resolved is not None:
+                    return resolved
+
+    return None
 
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:

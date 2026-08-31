@@ -59,6 +59,7 @@ coding-agent/
     trace.py
     tools.py
     prompts.py
+    policy.py
     context.py
     parser.py
     config.py
@@ -86,15 +87,16 @@ REPL 外壳，维护一个长期 session：
 python -m agent "任务"                    # one-shot：单任务 session，跑完即退
 python -m agent                           # 无任务 → 进 REPL，长期 session
 python -m agent --workspace ./demo ...    # workspace 缺省为当前目录 Path.cwd()
+python -m agent --max-steps 40 ...        # 覆盖单任务最大步数，便于演示调参
 ```
 
-它只做参数解析、`config.load_config`、构造 `Session`、REPL 循环（`input` 读任务、`session.submit`、打印 Report），不放复杂逻辑。退出时打印 session 级汇总。
+它只做参数解析、`config.load_config`、构造 `Session`、REPL 循环（`input` 读任务、`session.submit`、打印 Report），不放复杂逻辑。`--max-steps` 只影响单个 task，跨任务时每轮重新计数。
 
 ### `loop.py`
 
 单任务执行器（`Observe -> Think -> Act -> Observe`），由 Session 驱动。它只负责完成一个 task 的推理闭环，不保存跨任务状态。
 
-单任务状态（每任务重置）：step、连续解析失败、连续同类工具失败、安全拒绝计数。伪代码：
+单任务状态（每任务重置）：step、连续解析失败、连续同类工具失败、安全拒绝计数、task 级授权。伪代码：
 
 ```python
 def run_task(session, task) -> Report:
@@ -109,7 +111,18 @@ def run_task(session, task) -> Report:
             session.trace.log("stop", reason="final")
             return report(done=True, ...)
 
-        result = run_tool(action.action, action.args, session.workspace)
+        decision = policy.decide(session.mode, action.action)
+        if decision.deny:
+            result = ToolResult(ok=False, error="PolicyDenied", output=decision.reason)
+        elif decision.ask and policy.grant_key(action.action, action.args) not in task_grants:
+            result = (run_tool(action.action, action.args, session.workspace)
+                      if session.asker(action.action, action.args)
+                      else ToolResult(ok=False, error="UserDenied", output="用户拒绝执行该动作"))
+            if result.ok:
+                task_grants.add(policy.grant_key(action.action, action.args))
+        else:
+            result = run_tool(action.action, action.args, session.workspace)
+
         session.conversation.append_turn(action.action, action.args, result)
         session.trace.log("tool", tool=action.action, ok=result.ok, error=result.error)
 
@@ -123,6 +136,7 @@ def run_task(session, task) -> Report:
 跨任务状态与编排的核心对象：
 
 - 持有 `Conversation`、`Trace`、`workspace`、`llm`、`reports: list[Report]`。
+- 持有 `mode`（ask / readonly / auto）与 `asker` 回调（CLI 注入的 y/n 交互询问）。
 - `submit(task) -> Report`：把新 task 交给 loop 跑完，然后把结果写回 conversation + trace，保存 Report。
 - 支撑 REPL：一个 session 跑到底，直到用户退出才销毁 conversation。
 
@@ -209,9 +223,54 @@ TOOLS: dict[str, Tool] = {}   # 注册表；喂给模型的工具说明由这里
 安全约束（作为本文件的 helper，替代原 `sandbox.py`）：
 
 - `resolve_in_workspace(path, workspace)`：resolve 后必须落在 workspace 内，越权抛 `PathOutsideWorkspace`。
-- `check_command_policy(command)`：先拒引号外的 shell 操作符（`;` / `&&` / `|` / 反引号 / `$(`，引号内是字符串内容不算），再命中前缀白名单（`python` / `pytest` / `npm test` / `cargo test` / `go test`），未命中白名单则落回黑名单（`rm` / `del` / `pip install` …）拒绝，最终默认拒绝。MVP 只做 allow / deny。
+- `check_command_policy(command)`：先拒引号外的 shell 操作符（`;` / `&&` / `|` / 反引号 / `$(`，引号内是字符串内容不算），再命中前缀白名单（`python` / `pytest` / `mvn test` / `mvn -q test` / `npm test` / `cargo test` / `go test`），未命中白名单则落回黑名单（`rm` / `del` / `pip install` …）拒绝，最终默认拒绝。
 - 凭据保护：`read_file` / `write_file` 拒绝访问 `.env`、私钥（`id_rsa` / `*.pem` / `*.key`）；`grep` 静默跳过这些文件。
+- 噪声目录过滤：`list_files` / `glob` / `grep` 默认跳过 `.git`、`.venv`、`__pycache__`、`.pytest_cache`、`node_modules`、`target`、`dist`、`build` 等缓存、依赖和构建产物；显式 `read_file` / `write_file` 这些目录内文件时返回 `IgnoredPath`，减少上下文污染和无意义探索。
 - 跨平台：命令执行用 `subprocess.run(shell=False)`（配 `shlex.split` 拆词，安全边界由白名单策略承担）；路径用 `pathlib`。开发环境为 Windows，6 个工具须在 Windows 本机跑通才算 MVP 完成。
+
+### `policy.py`
+
+权限层位于 parser 和 tools 之间：LLM 只负责提出动作，runtime 根据任务模式裁决 `allow / ask / deny`。这层是 prompt 约束的硬化版本，避免"模型说要写就直接写"。
+
+三种运行模式：
+
+| 模式 | 读工具 | `write_file` | `run_command` |
+| --- | --- | --- | --- |
+| `ask`（默认） | allow | ask | ask |
+| `readonly` | allow | deny | deny |
+| `auto` | allow | allow | allow（仍受命令白名单限制） |
+
+模式来源：
+
+- CLI 默认 `ask`。
+- `--readonly` 强制整个 session 只读：任何授权都不能升级它。
+- `--auto` 用于演示或用户明确信任：写文件与白名单命令自动执行。
+
+ask 层只在当前进程内记录授权，不做持久化、不做恢复：
+
+```text
+y / yes     允许本任务内同类动作
+n / no      拒绝本次动作（默认）
+```
+
+- 会话级放行不在 ask 里，改用 `--auto` 启动时声明，避免中途反复确认。
+- 授权是**任务级**的（每任务重置）：换一个任务，写/跑要重新确认。
+
+授权粒度：
+
+- `write_file`：key 为 `write_file`。本任务放行一次，后续写文件都可继续。
+- `run_command`：按完整命令授权，key 为 `run_command:<command>`。`pytest -q` 与其他命令分开确认。
+- `readonly` 模式不读取任何授权，始终禁止 `write_file` 与 `run_command`。
+
+裁决顺序：
+
+1. `parser.parse(raw, TOOLS)` 只校验 JSON 与工具名/参数形状，不负责权限。
+2. `policy.decide(mode, action)` 判断当前模式下是 allow、ask 还是 deny。
+3. deny：不执行工具，合成 `ToolResult(ok=False, error="PolicyDenied", output=reason)` 回填给模型。
+4. ask：若本任务已授权同类动作则直接执行；否则 CLI 询问用户 y/n，拒绝则回填 `UserDenied`。
+5. allow：再进入 `tools.run_tool`，由工具层执行路径、敏感文件、命令白名单等底线校验。
+
+这使安全边界分层清楚：prompt 负责引导，policy 负责模式权限，tools 负责底层沙箱。
 
 ### `prompts.py`
 
@@ -285,7 +344,7 @@ action 只能是「可用工具」之一，或 final。
 以下终止条件都是**单任务内**的（每任务重置；Session 跨任务存在）：
 
 - `final` 动作：模型主动完成。
-- `max_steps`：默认 20 或 30 步。
+- `max_steps`：默认 50 步，可由 CLI 的 `--max-steps` 覆盖。
 - 连续解析失败：例如 3 次。
 - 连续同类工具失败：例如同一命令失败 3 次。
 - 安全拒绝：模型多次请求越权路径或危险命令。
@@ -297,7 +356,7 @@ action 只能是「可用工具」之一，或 final。
 - 修改了哪些文件
 - 是否运行测试
 - 测试结果
-- 未完成事项
+- 过程中遇到的问题（pending）
 
 ## 6. 错误处理策略
 
@@ -325,8 +384,9 @@ action 只能是「可用工具」之一，或 final。
 5. 路径限制在 workspace 内（含 Windows 兼容）。
 6. 每个 task 最多运行 20 步。
 7. 历史超阈值触发语义压缩（§3 三层上下文 + summarizer）。
-8. 危险命令直接拒绝并回填错误。
-9. 每个 task 输出一份 Report，REPL 继续等下一条任务。
+8. 模式 + ask 层：`read_only / edit / auto`，edit 下高风险动作询问用户。
+9. 危险命令直接拒绝并回填错误。
+10. 每个 task 输出一份 Report，REPL 继续等下一条任务。
 
 这个版本已满足项目要求中的核心逻辑自研：对话历史、上下文、工具定义、本地执行、输出解析、终止条件、错误处理。
 
@@ -335,9 +395,8 @@ action 只能是「可用工具」之一，或 final。
 按实现成本与面试可解释性排序：
 
 1. **Dry run 模式**：只展示计划和将要调用的工具，不真正写文件。
-2. **命令 ask 分级**：在 allow / deny 之外加 ask，对未知命令要求用户确认。
-3. **apply_patch 差异修改（可选，慎做）**：模型输出 unified diff，runtime 校验后应用。unified diff 的模糊匹配、行号漂移是已知工程坑；若做，建议用成熟 diff 库（如 `unidiff`，非 agent SDK，合规），并放到最后，避免卡进度。
-4. **只读批量**：一轮输出 `{"action": "batch", "actions": [{...}, {...}]}`，只允许低风险只读工具，用于列目录 + 读多文件提速。
+2. **apply_patch 差异修改（可选，慎做）**：模型输出 unified diff，runtime 校验后应用。unified diff 的模糊匹配、行号漂移是已知工程坑；若做，建议用成熟 diff 库（如 `unidiff`，非 agent SDK，合规），并放到最后，避免卡进度。
+3. **只读批量**：一轮输出 `{"action": "batch", "actions": [{...}, {...}]}`，只允许低风险只读工具，用于列目录 + 读多文件提速。
 
 ## 9. 演示任务建议
 

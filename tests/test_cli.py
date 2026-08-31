@@ -52,6 +52,11 @@ def test_parse_args_default_workspace():
     assert args.workspace == "."
 
 
+def test_parse_args_max_steps():
+    args = cli._parse_args(["任务", "--max-steps", "12"])
+    assert args.max_steps == 12
+
+
 # ---- _repl ----
 
 def test_repl_exits_on_empty(monkeypatch):
@@ -77,6 +82,26 @@ def test_repl_submits_tasks(monkeypatch):
     assert s.submitted == ["任务1", "任务2"]
 
 
+def test_ask_prompt_mentions_task_scope(monkeypatch):
+    prompts = []
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        return "y"
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    assert cli._ask("write_file", {"path": "a.py"}) is True
+    assert "本任务" in prompts[0]
+
+
+def test_print_parse_error_is_friendly(capsys):
+    cli._print_step("parse_error", step=3, err="JSON 对象括号未配平")
+    out = capsys.readouterr().out
+    assert "parse_error" in out
+    assert "已要求重试" in out
+    assert "JSON 对象括号未配平" not in out
+
+
 # ---- main ----
 
 def test_main_config_error_returns_1(monkeypatch, capsys):
@@ -97,7 +122,7 @@ def test_main_one_shot(monkeypatch):
 
     monkeypatch.setattr(cli, "load_config", lambda: object())
     monkeypatch.setattr(cli, "LLM", lambda cfg: object())
-    monkeypatch.setattr(cli, "Session", lambda llm, ws, trace=None: s)
+    monkeypatch.setattr(cli, "Session", lambda *a, **kw: s)
     monkeypatch.setattr(cli, "start_trace", fake_trace)
     monkeypatch.setattr(cli, "build_system_prompt", lambda tools: "rules")
     monkeypatch.setattr(cli, "render_report", lambda r: r)
@@ -114,10 +139,33 @@ def test_main_no_task_enters_repl(monkeypatch):
 
     monkeypatch.setattr(cli, "load_config", lambda: object())
     monkeypatch.setattr(cli, "LLM", lambda cfg: object())
-    monkeypatch.setattr(cli, "Session", lambda llm, ws, trace=None: s)
+    monkeypatch.setattr(cli, "Session", lambda *a, **kw: s)
     monkeypatch.setattr(cli, "start_trace", fake_trace)
     monkeypatch.setattr(cli, "build_system_prompt", lambda tools: "rules")
     monkeypatch.setattr(builtins, "input", _fake_inputs([""]))  # 空行退出 REPL
     monkeypatch.setattr(cli, "render_report", lambda r: r)
     assert cli.main([]) == 0
     assert s.submitted == []
+
+
+def test_main_passes_max_steps(monkeypatch):
+    s = _FakeSession()
+    captured = {}
+
+    @contextmanager
+    def fake_trace():
+        yield object()
+
+    def fake_session(*args, **kwargs):
+        captured.update(kwargs)
+        return s
+
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(cli, "LLM", lambda cfg: object())
+    monkeypatch.setattr(cli, "Session", fake_session)
+    monkeypatch.setattr(cli, "start_trace", fake_trace)
+    monkeypatch.setattr(cli, "build_system_prompt", lambda tools: "rules")
+    monkeypatch.setattr(cli, "render_report", lambda r: r)
+
+    assert cli.main(["任务", "--max-steps", "12"]) == 0
+    assert captured["max_steps"] == 12

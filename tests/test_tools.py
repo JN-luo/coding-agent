@@ -111,6 +111,65 @@ def test_grep_skips_credentials(tmp_path):
     assert ".env" not in result.output
 
 
+# ---- 噪声目录保护 ----
+
+def test_list_files_skips_noise_dirs(tmp_path):
+    (tmp_path / ".pytest_cache").mkdir()
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "target").mkdir()
+    (tmp_path / "a.py").write_text("x")
+    result = run_tool("list_files", {"path": "."}, tmp_path)
+    assert result.ok is True
+    assert "a.py" in result.output
+    assert ".pytest_cache" not in result.output
+    assert "__pycache__" not in result.output
+    assert "target" not in result.output
+
+
+def test_read_file_in_noise_dir_rejected(tmp_path):
+    cache = tmp_path / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "nodeids").write_text("test_a.py::test_ok")
+    result = run_tool("read_file", {"path": ".pytest_cache/v/cache/nodeids"}, tmp_path)
+    assert result.ok is False
+    assert result.error == "IgnoredPath"
+
+
+def test_write_file_in_noise_dir_rejected(tmp_path):
+    result = run_tool("write_file", {"path": "__pycache__/x.pyc", "content": "x"}, tmp_path)
+    assert result.ok is False
+    assert result.error == "IgnoredPath"
+    assert not (tmp_path / "__pycache__" / "x.pyc").exists()
+
+
+def test_glob_skips_noise_dirs(tmp_path):
+    (tmp_path / ".pytest_cache").mkdir()
+    (tmp_path / ".pytest_cache" / "nodeids").write_text("x")
+    (tmp_path / "a.py").write_text("x")
+    result = run_tool("glob", {"pattern": "**"}, tmp_path)
+    assert result.ok is True
+    assert "a.py" in result.output
+    assert ".pytest_cache" not in result.output
+
+
+def test_grep_skips_noise_dirs(tmp_path):
+    cache = tmp_path / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "lastfailed").write_text("needle")
+    (tmp_path / "a.py").write_text("needle")
+    result = run_tool("grep", {"pattern": "needle", "path": "."}, tmp_path)
+    assert result.ok is True
+    assert "a.py" in result.output
+    assert ".pytest_cache" not in result.output
+
+
+def test_grep_noise_dir_rejected(tmp_path):
+    (tmp_path / ".pytest_cache").mkdir()
+    result = run_tool("grep", {"pattern": "x", "path": ".pytest_cache"}, tmp_path)
+    assert result.ok is False
+    assert result.error == "IgnoredPath"
+
+
 # ---- read_file ----
 
 def test_read_file_ok(tmp_path):
@@ -263,6 +322,11 @@ def test_policy_allows_pytest():
     assert check_command_policy("pytest test_calculator.py -v") == "allow"
 
 
+def test_policy_allows_maven_test():
+    assert check_command_policy("mvn test") == "allow"
+    assert check_command_policy("mvn -q test") == "allow"
+
+
 def test_policy_denies_unknown():
     assert check_command_policy("git status") == "deny"
 
@@ -278,6 +342,45 @@ def test_run_command_python_uses_sys_executable(tmp_path):
     result = run_tool("run_command", {"command": "python -c \"print(__import__('sys').executable)\""}, tmp_path)
     assert result.ok is True
     assert result.output.strip() == sys.executable
+
+
+def test_run_command_resolves_windows_maven_cmd(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_which(command):
+        calls.append(command)
+        if command == "mvn.cmd":
+            return r"C:\tools\maven\bin\mvn.cmd"
+        return None
+
+    class Completed:
+        stdout = "ok"
+        stderr = ""
+        returncode = 0
+
+    def fake_run(parts, **kwargs):
+        assert parts == [r"C:\tools\maven\bin\mvn.cmd", "-q", "test"]
+        return Completed()
+
+    monkeypatch.setattr(tools_mod.os, "name", "nt")
+    monkeypatch.setattr(tools_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(tools_mod.subprocess, "run", fake_run)
+
+    result = run_tool("run_command", {"command": "mvn -q test"}, tmp_path)
+
+    assert result.ok is True
+    assert result.output == "ok"
+    assert calls == ["mvn", "mvn.cmd"]
+
+
+def test_run_command_reports_missing_executable(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools_mod.shutil, "which", lambda command: None)
+
+    result = run_tool("run_command", {"command": "mvn -q test"}, tmp_path)
+
+    assert result.ok is False
+    assert result.error == "CommandError"
+    assert result.output == "executable not found: mvn"
 
 
 def test_run_command_denied(tmp_path):

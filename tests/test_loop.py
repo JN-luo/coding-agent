@@ -100,7 +100,7 @@ def test_parse_failure_then_recover(tmp_path):
 
 def test_same_tool_failure(tmp_path):
     cmd = j("run_command", {"command": "python -m pytest"})
-    s = session(tmp_path, [cmd], run_tool_fn=fail_run_tool)
+    s = session(tmp_path, [cmd], run_tool_fn=fail_run_tool, mode="auto")
     r = run_task(s, "任务")
     assert r.stop_reason == "same_tool_failures"
 
@@ -112,13 +112,160 @@ def test_safety_rejection(tmp_path):
     assert r.stop_reason == "safety_rejections"
 
 
+def test_on_step_callback(tmp_path):
+    events = []
+
+    def on_step(kind, **fields):
+        events.append(kind)
+
+    s = Session(FakeLLM([j("list_files", {"path": "."}), jfinal("ok")]), tmp_path,
+                run_tool_fn=ok_run_tool, on_step=on_step)
+    run_task(s, "任务")
+    assert events == ["action", "tool", "action"]
+
+
+def test_auto_mode_allows_write(tmp_path):
+    s = Session(FakeLLM([j("write_file", {"path": "a.py", "content": "x"}), jfinal("ok")]), tmp_path,
+                run_tool_fn=ok_run_tool, mode="auto")
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    assert any(t.action == "write_file" and t.result.ok for t in s.conversation.turns)
+
+
+def test_readonly_mode_denies_write(tmp_path):
+    s = Session(FakeLLM([j("write_file", {"path": "a.py", "content": "x"}), jfinal("ok")]), tmp_path,
+                run_tool_fn=ok_run_tool, mode="readonly")
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    write_turns = [t for t in s.conversation.turns if t.action == "write_file"]
+    assert write_turns and write_turns[0].result.error == "PolicyDenied"
+
+
+def test_ask_mode_grants_after_first_yes(tmp_path):
+    asks = []
+
+    def asker(action, args):
+        asks.append((action, args))
+        return True
+
+    responses = [
+        j("write_file", {"path": "a.py", "content": "x"}),
+        j("write_file", {"path": "b.py", "content": "y"}),
+        jfinal("ok"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    assert len(asks) == 1  # 同类 write_file 第二次免问
+    assert len([t for t in s.conversation.turns if t.action == "write_file"]) == 2
+
+
+def test_ask_mode_grants_do_not_cross_tasks(tmp_path):
+    asks = []
+
+    def asker(action, args):
+        asks.append((action, args))
+        return True
+
+    responses = [
+        j("write_file", {"path": "a.py", "content": "x"}),
+        jfinal("t1"),
+        j("write_file", {"path": "b.py", "content": "y"}),
+        jfinal("t2"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
+    s.submit("任务1")
+    s.submit("任务2")
+    assert [action for action, _ in asks] == ["write_file", "write_file"]
+
+
+def test_ask_mode_grants_run_command_by_exact_command(tmp_path):
+    asks = []
+
+    def asker(action, args):
+        asks.append(args["command"])
+        return True
+
+    responses = [
+        j("run_command", {"command": "pytest -q"}),
+        j("run_command", {"command": "pytest -q"}),
+        j("run_command", {"command": "pytest -q test_calculator.py"}),
+        jfinal("ok"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    assert asks == ["pytest -q", "pytest -q test_calculator.py"]
+
+
+def test_ask_mode_denies_on_no(tmp_path):
+    s = Session(FakeLLM([j("write_file", {"path": "a.py", "content": "x"}), jfinal("ok")]), tmp_path,
+                run_tool_fn=ok_run_tool, mode="ask", asker=lambda a, args: False)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    write_turns = [t for t in s.conversation.turns if t.action == "write_file"]
+    assert write_turns and write_turns[0].result.error == "UserDenied"
+
+
+def test_ask_mode_denies_same_action_without_asking_again(tmp_path):
+    asks = []
+
+    def asker(action, args):
+        asks.append((action, args))
+        return False
+
+    responses = [
+        j("write_file", {"path": "a.py", "content": "x"}),
+        j("write_file", {"path": "b.py", "content": "y"}),
+        jfinal("ok"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "user_denied"
+    assert len(asks) == 1
+    write_turns = [t for t in s.conversation.turns if t.action == "write_file"]
+    assert len(write_turns) == 2
+    assert all(t.result.error == "UserDenied" for t in write_turns)
+
+
+def test_ask_mode_user_denied_stop_after_two_denials(tmp_path):
+    responses = [
+        j("write_file", {"path": "a.py", "content": "x"}),
+        j("run_command", {"command": "pytest -q"}),
+        jfinal("ok"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=lambda a, args: False)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "user_denied"
+    assert r.done is False
+
+
+def test_ask_mode_denies_do_not_cross_tasks(tmp_path):
+    asks = []
+
+    def asker(action, args):
+        asks.append((action, args))
+        return False
+
+    responses = [
+        j("write_file", {"path": "a.py", "content": "x"}),
+        jfinal("t1"),
+        j("write_file", {"path": "b.py", "content": "y"}),
+        jfinal("t2"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
+    s.submit("任务1")
+    s.submit("任务2")
+    assert [action for action, _ in asks] == ["write_file", "write_file"]
+
+
 def test_different_failures_do_not_stack(tmp_path):
     responses = [
         j("run_command", {"command": "python -m pytest"}),
         j("run_command", {"command": "python -m unittest"}),
         jfinal("ok"),
     ]
-    s = session(tmp_path, responses, run_tool_fn=fail_run_tool)
+    s = session(tmp_path, responses, run_tool_fn=fail_run_tool, mode="auto")
     r = run_task(s, "任务")
     assert r.stop_reason == "final"
 
@@ -130,7 +277,7 @@ def test_report_scoped_to_current_task(tmp_path):
         j("write_file", {"path": "a.py", "content": "x"}), jfinal("t1"),
         j("write_file", {"path": "b.py", "content": "y"}), jfinal("t2"),
     ]
-    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool)
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="auto")
     r1 = s.submit("任务1")
     r2 = s.submit("任务2")
     assert r1.modified_files == ("a.py",)
