@@ -8,6 +8,10 @@ from dataclasses import dataclass
 
 READ_TOOLS = frozenset({"list_files", "read_file", "glob", "grep"})
 
+ASK_ONCE = "once"
+ASK_REMEMBER = "remember"
+ASK_DENY = "deny"
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -27,7 +31,22 @@ def decide(mode: str, action: str) -> Decision:
 
 
 def grant_key(action: str, args: dict) -> str:
-    """授权粒度：write_file 按 action；run_command 按完整命令。"""
+    """任务内记住授权的粒度：write_file 按工具，run_command 按完整命令。"""
     if action == "run_command":
         return f"run_command:{args.get('command', '')}"
     return action
+
+
+def normalize_ask_choice(value) -> str:
+    """兼容 CLI 的字符串选择，也兼容旧的 bool asker。"""
+    if value is True:
+        return ASK_REMEMBER
+    if value is False or value is None:
+        return ASK_DENY
+    if isinstance(value, str):
+        choice = value.strip().lower()
+        if choice in (ASK_ONCE, "y", "yes"):
+            return ASK_ONCE
+        if choice in (ASK_REMEMBER, "a", "always"):
+            return ASK_REMEMBER
+    return ASK_DENY

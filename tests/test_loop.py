@@ -9,22 +9,26 @@
 
 import json
 
-from agent.llm import LLMError
+from agent.llm import LLMError, ModelResponse, ModelToolCall
 from agent.loop import Report, build_report, render_report, run_task
 from agent.messages import Turn
+from agent.policy import ASK_DENY, ASK_ONCE, ASK_REMEMBER
 from agent.session import Session
 from agent.tools import ToolResult
 
 
 def j(action, args=None):
-    d = {"action": action}
-    if args is not None:
-        d["args"] = args
-    return json.dumps(d)
+    return ModelResponse(tool_calls=[ModelToolCall(id="call_1", name=action, arguments=args or {})])
+
+
+def jbad_args(action):
+    return ModelResponse(tool_calls=[
+        ModelToolCall(id="call_1", name=action, arguments={}, raw_arguments='{"path":', parse_error="bad json")
+    ])
 
 
 def jfinal(msg="done"):
-    return json.dumps({"action": "final", "message": msg})
+    return ModelResponse(content=msg)
 
 
 class FakeLLM:
@@ -33,7 +37,7 @@ class FakeLLM:
         self.calls = []
         self.summarize_raises = summarize_raises
 
-    def complete(self, messages):
+    def complete(self, messages, tools=None):
         self.calls.append(messages)
         if len(self.responses) > 1:
             return self.responses.pop(0)
@@ -76,26 +80,19 @@ def test_final_action(tmp_path):
     assert r.steps == 1
 
 
+def test_empty_response_is_not_final(tmp_path):
+    s = session(tmp_path, [ModelResponse(content="")])
+    r = run_task(s, "任务")
+    assert r.done is False
+    assert r.stop_reason == "llm_error"
+
+
 def test_max_steps(tmp_path):
     s = session(tmp_path, [j("list_files", {"path": "."})], max_steps=3)
     r = run_task(s, "任务")
     assert r.done is False
     assert r.stop_reason == "max_steps"
     assert r.steps == 3
-
-
-def test_parse_failures(tmp_path):
-    s = session(tmp_path, ["这不是 json"])
-    r = run_task(s, "任务")
-    assert r.stop_reason == "parse_failures"
-    assert r.done is False
-
-
-def test_parse_failure_then_recover(tmp_path):
-    s = session(tmp_path, ["这不是 json", j("list_files", {"path": "."}), jfinal("ok")])
-    r = run_task(s, "任务")
-    assert r.stop_reason == "final"
-    assert r.done is True
 
 
 def test_same_tool_failure(tmp_path):
@@ -121,7 +118,47 @@ def test_on_step_callback(tmp_path):
     s = Session(FakeLLM([j("list_files", {"path": "."}), jfinal("ok")]), tmp_path,
                 run_tool_fn=ok_run_tool, on_step=on_step)
     run_task(s, "任务")
-    assert events == ["action", "tool", "action"]
+    assert events == ["action", "tool"]
+
+
+def test_on_step_callback_uses_substeps_for_multiple_tool_calls(tmp_path):
+    labels = []
+
+    def on_step(kind, **fields):
+        if kind == "action":
+            labels.append((fields["step"], fields.get("substep"), fields["action"]))
+
+    response = ModelResponse(tool_calls=[
+        ModelToolCall(id="call_1", name="list_files", arguments={"path": "."}),
+        ModelToolCall(id="call_2", name="read_file", arguments={"path": "a.py"}),
+    ])
+    s = Session(FakeLLM([response, jfinal("ok")]), tmp_path, run_tool_fn=ok_run_tool, on_step=on_step)
+    run_task(s, "任务")
+    assert labels == [(1, 1, "list_files"), (1, 2, "read_file")]
+
+
+def test_tool_call_argument_parse_error_becomes_observation(tmp_path):
+    s = session(tmp_path, [jbad_args("read_file"), jfinal("ok")])
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    turn = s.conversation.turns[0]
+    assert turn.action == "read_file"
+    assert turn.result.error == "InvalidArgs"
+    assert "bad json" in turn.result.output
+
+
+def test_trace_records_failed_output_preview(tmp_path):
+    tracer = FakeTracer()
+
+    def boom(action, args, workspace):
+        return ToolResult(ok=False, output="x" * 2000, error="CommandFailed")
+
+    s = Session(FakeLLM([j("run_command", {"command": "pytest -q"}), jfinal("ok")]), tmp_path,
+                trace=tracer, run_tool_fn=boom, mode="auto")
+    run_task(s, "任务")
+    tool_events = [fields for event, fields in tracer.events if event == "tool"]
+    assert tool_events[0]["output_preview"].endswith("...")
+    assert len(tool_events[0]["output_preview"]) < 1200
 
 
 def test_auto_mode_allows_write(tmp_path):
@@ -141,12 +178,12 @@ def test_readonly_mode_denies_write(tmp_path):
     assert write_turns and write_turns[0].result.error == "PolicyDenied"
 
 
-def test_ask_mode_grants_after_first_yes(tmp_path):
+def test_ask_mode_once_allows_only_current_call(tmp_path):
     asks = []
 
     def asker(action, args):
         asks.append((action, args))
-        return True
+        return ASK_ONCE
 
     responses = [
         j("write_file", {"path": "a.py", "content": "x"}),
@@ -156,8 +193,27 @@ def test_ask_mode_grants_after_first_yes(tmp_path):
     s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
     r = run_task(s, "任务")
     assert r.stop_reason == "final"
-    assert len(asks) == 1  # 同类 write_file 第二次免问
+    assert len(asks) == 2
     assert len([t for t in s.conversation.turns if t.action == "write_file"]) == 2
+
+
+def test_ask_mode_remember_write_allows_later_writes(tmp_path):
+    asks = []
+
+    def asker(action, args):
+        asks.append((action, args))
+        return ASK_REMEMBER
+
+    responses = [
+        j("write_file", {"path": "a.py", "content": "x"}),
+        j("write_file", {"path": "b.py", "content": "y"}),
+        jfinal("ok"),
+    ]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "final"
+    assert len(asks) == 1
+    assert len([t for t in s.conversation.turns if t.action == "write_file" and t.result.ok]) == 2
 
 
 def test_ask_mode_grants_do_not_cross_tasks(tmp_path):
@@ -165,7 +221,7 @@ def test_ask_mode_grants_do_not_cross_tasks(tmp_path):
 
     def asker(action, args):
         asks.append((action, args))
-        return True
+        return ASK_REMEMBER
 
     responses = [
         j("write_file", {"path": "a.py", "content": "x"}),
@@ -184,7 +240,7 @@ def test_ask_mode_grants_run_command_by_exact_command(tmp_path):
 
     def asker(action, args):
         asks.append(args["command"])
-        return True
+        return ASK_REMEMBER
 
     responses = [
         j("run_command", {"command": "pytest -q"}),
@@ -200,19 +256,20 @@ def test_ask_mode_grants_run_command_by_exact_command(tmp_path):
 
 def test_ask_mode_denies_on_no(tmp_path):
     s = Session(FakeLLM([j("write_file", {"path": "a.py", "content": "x"}), jfinal("ok")]), tmp_path,
-                run_tool_fn=ok_run_tool, mode="ask", asker=lambda a, args: False)
+                run_tool_fn=ok_run_tool, mode="ask", asker=lambda a, args: ASK_DENY)
     r = run_task(s, "任务")
     assert r.stop_reason == "final"
     write_turns = [t for t in s.conversation.turns if t.action == "write_file"]
     assert write_turns and write_turns[0].result.error == "UserDenied"
 
 
-def test_ask_mode_denies_same_action_without_asking_again(tmp_path):
+def test_ask_mode_deny_does_not_block_later_write(tmp_path):
     asks = []
+    choices = iter([ASK_DENY, ASK_ONCE])
 
     def asker(action, args):
         asks.append((action, args))
-        return False
+        return next(choices)
 
     responses = [
         j("write_file", {"path": "a.py", "content": "x"}),
@@ -221,20 +278,33 @@ def test_ask_mode_denies_same_action_without_asking_again(tmp_path):
     ]
     s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=asker)
     r = run_task(s, "任务")
-    assert r.stop_reason == "user_denied"
-    assert len(asks) == 1
+    assert r.stop_reason == "final"
+    assert len(asks) == 2
     write_turns = [t for t in s.conversation.turns if t.action == "write_file"]
-    assert len(write_turns) == 2
-    assert all(t.result.error == "UserDenied" for t in write_turns)
+    assert write_turns[0].result.error == "UserDenied"
+    assert write_turns[1].result.ok
 
 
-def test_ask_mode_user_denied_stop_after_two_denials(tmp_path):
+def test_ask_mode_stops_after_three_consecutive_denials(tmp_path):
     responses = [
         j("write_file", {"path": "a.py", "content": "x"}),
         j("run_command", {"command": "pytest -q"}),
+        j("write_file", {"path": "b.py", "content": "y"}),
         jfinal("ok"),
     ]
-    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=lambda a, args: False)
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask",
+                asker=lambda a, args: ASK_DENY)
+    r = run_task(s, "任务")
+    assert r.stop_reason == "user_denied"
+    assert r.done is False
+    assert len(s.conversation.turns) == 3
+
+
+def test_ask_mode_stops_after_three_command_denials(tmp_path):
+    responses = [
+        j("run_command", {"command": f"pytest -q -k test_{i}"}) for i in range(5)
+    ] + [jfinal("ok")]
+    s = Session(FakeLLM(responses), tmp_path, run_tool_fn=ok_run_tool, mode="ask", asker=lambda a, args: ASK_DENY)
     r = run_task(s, "任务")
     assert r.stop_reason == "user_denied"
     assert r.done is False
@@ -245,7 +315,7 @@ def test_ask_mode_denies_do_not_cross_tasks(tmp_path):
 
     def asker(action, args):
         asks.append((action, args))
-        return False
+        return ASK_DENY
 
     responses = [
         j("write_file", {"path": "a.py", "content": "x"}),
@@ -297,6 +367,16 @@ def test_build_report_derives_fields():
     assert r.ran_tests is True
     assert r.test_result == "1 passed in 0.5s"
     assert any("run_command" in p and "CommandFailed" in p for p in r.pending)
+
+
+def test_build_report_prefers_successful_test_result():
+    turns = [
+        Turn("run_command", {"command": "mvn test"}, ToolResult(ok=True, output="BUILD SUCCESS")),
+        Turn("run_command", {"command": "mvn -q clean test"}, ToolResult(ok=False, output="command denied", error="PolicyDenied")),
+    ]
+    r = build_report(turns, done=False, message="m", stop_reason="safety_rejections", steps=2)
+    assert r.ran_tests is True
+    assert r.test_result == "BUILD SUCCESS"
 
 
 def test_render_report(tmp_path):

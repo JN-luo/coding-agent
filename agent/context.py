@@ -9,7 +9,6 @@
 context 只负责从 conversation 装配和触发压缩，不做规则摘要。
 """
 
-import json
 from collections.abc import Callable
 
 from agent.messages import Turn, format_observation
@@ -32,9 +31,7 @@ def build(conversation, *, recent_turns=RECENT_TURNS, max_chars=MAX_CONTEXT_CHAR
         messages.append({"role": "user", "content": "之前步骤的摘要：\n" + summary})
         if conversation.last_task:
             messages.append({"role": "user", "content": conversation.last_task})
-        for t in turns[-recent_turns:] if recent_turns > 0 else []:
-            messages.append({"role": "assistant", "content": _render_action(t)})
-            messages.append({"role": "user", "content": format_observation(t.action, t.result)})
+        messages.extend(_recent_tool_messages(conversation, recent_turns))
         return messages
     return conversation.as_openai()
 
@@ -63,9 +60,37 @@ def _system_content(conversation) -> str:
     return ""
 
 
-def _render_action(turn) -> str:
-    return json.dumps({"action": turn.action, "args": turn.args}, ensure_ascii=False)
+def _recent_tool_messages(conversation, recent_turns) -> list[dict]:
+    """保留最近工具调用的原始消息片段，避免丢失 provider-specific 字段。"""
+    if recent_turns <= 0:
+        return []
+    messages = conversation.as_openai()
+    tool_seen = 0
+    start = None
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") == "tool":
+            tool_seen += 1
+            if tool_seen >= recent_turns:
+                start = _tool_group_start(messages, i)
+                break
+    if start is None:
+        return []
+    return [
+        m for m in messages[start:]
+        if m.get("role") == "tool" or (m.get("role") == "assistant" and m.get("tool_calls"))
+    ]
+
+
+def _tool_group_start(messages, tool_index) -> int:
+    for i in range(tool_index - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            return i
+        if msg.get("role") in {"user", "system"}:
+            break
+    return tool_index
 
 
 def _trajectory_chars(turns) -> int:
-    return sum(len(_render_action(t)) + len(format_observation(t.action, t.result)) for t in turns)
+    return sum(len(str(t.args)) + len(format_observation(t.action, t.result)) for t in turns)

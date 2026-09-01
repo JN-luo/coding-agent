@@ -46,6 +46,17 @@ class Tool:
     parameters: dict
     execute: Callable[[dict, Path], ToolResult]
 
+    def to_schema(self) -> dict:
+        """转成 OpenAI function-calling 的工具 schema。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
 
 SENSITIVE_FILENAMES = {
     ".env",
@@ -101,8 +112,6 @@ DENIED_COMMAND_WORDS = {
 ALLOWED_COMMAND_PREFIXES = (
     "python",
     "pytest",
-    "mvn test",
-    "mvn -q test",
     "npm test",
     "cargo test",
     "go test",
@@ -119,6 +128,7 @@ def run_tool(name: str, args: dict, workspace: Path) -> ToolResult:
         return ToolResult(ok=False, output="", error="InvalidArgs")
 
     try:
+        _validate_args(tool, args)
         return tool.execute(args, workspace)
     except ToolError as exc:
         return ToolResult(ok=False, output=exc.message, error=exc.error_type)
@@ -163,6 +173,8 @@ def check_command_policy(command: str) -> str:
         return "deny"
 
     normalized = " ".join(parts).lower()
+    if _is_allowed_maven_test(parts):
+        return "allow"
 
     # 前缀白名单优先于黑名单：否则 `npm test` 会因 `npm` 在黑名单而被误拒。
     if _matches_allow_prefix(normalized):
@@ -179,6 +191,32 @@ def _matches_allow_prefix(normalized: str) -> bool:
     for prefix in ALLOWED_COMMAND_PREFIXES:
         if normalized == prefix or normalized.startswith(prefix + " "):
             return True
+    return False
+
+
+def _is_allowed_maven_test(parts: list[str]) -> bool:
+    first = _command_basename(parts[0]).lower() if parts else ""
+    if first not in {"mvn", "mvn.cmd", "mvn.bat", "mvn.exe"}:
+        return False
+    allowed_options = {"-q", "--quiet", "-e", "-x", "-DskipTests=false"}
+    goals = []
+    for part in parts[1:]:
+        if part in allowed_options:
+            continue
+        if _is_allowed_maven_test_property(part):
+            continue
+        goals.append(part.lower())
+    return goals in (["test"], ["clean", "test"])
+
+
+def _is_allowed_maven_test_property(part: str) -> bool:
+    if part == "-DskipTests=false":
+        return True
+    if part == "-DfailIfNoTests=false":
+        return True
+    if part.startswith("-Dtest="):
+        value = part.removeprefix("-Dtest=")
+        return bool(value) and re.fullmatch(r"[A-Za-z0-9_.*#,]+", value) is not None
     return False
 
 
@@ -394,6 +432,8 @@ def _run_command(args: dict, workspace: Path) -> ToolResult:
     output = _truncate(output, MAX_COMMAND_OUTPUT)
     if completed.returncode != 0:
         return ToolResult(ok=False, output=output, error="CommandFailed")
+    if output == "":
+        output = "命令执行成功，无输出。"
     return ToolResult(ok=True, output=output)
 
 
@@ -420,6 +460,39 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
         "required": required or [],
         "additionalProperties": False,
     }
+
+
+def _validate_args(tool: Tool, args: dict) -> None:
+    schema = tool.parameters
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    for key in required:
+        if key not in args:
+            raise ToolError("InvalidArgs", f"缺少必要参数: {key}")
+    if schema.get("additionalProperties") is False:
+        extras = sorted(set(args) - set(properties))
+        if extras:
+            raise ToolError("InvalidArgs", "未知参数: " + ", ".join(extras))
+    for key, value in args.items():
+        expected = properties.get(key, {}).get("type")
+        if expected and not _matches_json_type(value, expected):
+            raise ToolError("InvalidArgs", f"{key} 类型错误，应为 {expected}")
+
+
+def _matches_json_type(value, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    return True
 
 
 TOOLS: dict[str, Tool] = {

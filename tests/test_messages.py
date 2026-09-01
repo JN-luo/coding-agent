@@ -3,8 +3,8 @@
 覆盖 DESIGN.md §3 messages.py：
   - Message / Turn 数据结构
   - format_observation 成功/失败两种 JSON 形状（§6）
-  - Conversation：set_system / add_task / append_turn / as_openai / total_chars
-  - messages + turns 双轨累积，跨任务
+  - Conversation：set_system / add_task / append_assistant_tool_calls / append_tool_result / add_final
+  - as_openai 发射 tool_calls / tool_call_id 形状
 """
 
 import json
@@ -21,12 +21,28 @@ def fail(error="E", output=""):
     return ToolResult(ok=False, output=output, error=error)
 
 
+class TC:
+    def __init__(self, id="call_1", name="list_files", arguments=None, raw_arguments="{}"):
+        self.id = id
+        self.name = name
+        self.arguments = arguments or {}
+        self.raw_arguments = raw_arguments
+        self.parse_error = ""
+
+
+class Response:
+    def __init__(self, tool_calls, reasoning_content=None):
+        self.tool_calls = tool_calls
+        self.reasoning_content = reasoning_content
+
+
 # ---- Message / Turn ----
 
 def test_message_fields():
     m = Message("user", "hi")
     assert m.role == "user"
     assert m.content == "hi"
+    assert m.name is None
 
 
 def test_turn_fields():
@@ -56,55 +72,69 @@ def test_set_system_prepends_and_replaces():
     conv.set_system("rules")
     assert [m.role for m in conv.messages] == ["system", "user"]
     conv.set_system("rules2")
-    assert [m.role for m in conv.messages] == ["system", "user"]
     assert conv.messages[0].content == "rules2"
 
 
-def test_append_turn_tracks_both():
+def test_append_tool_result_tracks_both():
     conv = Conversation()
     conv.add_task("t")
-    conv.append_turn("list_files", {"path": "."}, ok("a.py"))
-    # messages: [user task, assistant, user obs]
-    assert [m.role for m in conv.messages] == ["user", "assistant", "user"]
+    conv.append_tool_result("call_1", "list_files", {"path": "."}, ok("a.py"))
+    assert [m.role for m in conv.messages] == ["user", "tool"]
     assert len(conv.turns) == 1
     assert conv.turns[0].action == "list_files"
 
 
-def test_append_turn_assistant_is_canonical():
-    conv = Conversation()
-    conv.add_task("t")
-    conv.append_turn("list_files", {"path": "."}, ok("a.py"))
-    assistant = conv.messages[1]
-    assert assistant.role == "assistant"
-    assert json.loads(assistant.content) == {"action": "list_files", "args": {"path": "."}}
-
-
-def test_add_final_appends_assistant():
+def test_add_final_appends_plain_assistant():
     conv = Conversation()
     conv.add_task("t")
     conv.add_final("搞定了")
     assert [m.role for m in conv.messages] == ["user", "assistant"]
-    assert json.loads(conv.messages[1].content) == {"action": "final", "message": "搞定了"}
-    assert conv.turns == []  # final 不进 turns
+    assert conv.messages[1].content == "搞定了"
 
 
-def test_cross_task_accumulates():
+def test_append_assistant_tool_calls():
     conv = Conversation()
-    conv.add_task("task1")
-    conv.append_turn("list_files", {}, ok("a.py"))
-    conv.add_task("task2")
-    conv.append_turn("read_file", {"path": "a.py"}, ok("x=1"))
-    assert [m.role for m in conv.messages] == ["user", "assistant", "user", "user", "assistant", "user"]
-    assert len(conv.turns) == 2
-    assert conv.turns[1].action == "read_file"
+    conv.add_task("t")
+    conv.append_assistant_tool_calls(Response([TC(arguments={"path": "."})]))
+    m = conv.messages[-1]
+    assert m.role == "assistant"
+    assert m.tool_calls == [{"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": '{"path": "."}'}}]
 
 
-def test_as_openai_and_total_chars():
+def test_append_assistant_tool_calls_preserves_raw_arguments():
+    conv = Conversation()
+    conv.add_task("t")
+    conv.append_assistant_tool_calls(Response([TC(arguments={}, raw_arguments='{"path":')]))
+    assert conv.messages[-1].tool_calls[0]["function"]["arguments"] == '{"path":'
+
+
+def test_append_assistant_tool_calls_preserves_reasoning_content():
+    conv = Conversation()
+    conv.add_task("t")
+    conv.append_assistant_tool_calls(Response([TC()], reasoning_content="thinking"))
+    msgs = conv.as_openai()
+    assert msgs[-1]["reasoning_content"] == "thinking"
+
+
+def test_as_openai_emits_tool_shape():
     conv = Conversation()
     conv.set_system("rules")
     conv.add_task("hi")
-    assert conv.as_openai() == [
-        {"role": "system", "content": "rules"},
-        {"role": "user", "content": "hi"},
-    ]
-    assert conv.total_chars() == len("rules") + len("hi")
+    conv.append_assistant_tool_calls(Response([TC()]))
+    conv.append_tool_result("call_1", "list_files", {"path": "."}, ok("a.py"))
+    msgs = conv.as_openai()
+    assert msgs[0] == {"role": "system", "content": "rules"}
+    assert msgs[1] == {"role": "user", "content": "hi"}
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[2]["content"] is None
+    assert "tool_calls" in msgs[2]
+    assert msgs[3]["role"] == "tool"
+    assert msgs[3]["tool_call_id"] == "call_1"
+    assert msgs[3]["name"] == "list_files"
+
+
+def test_total_chars():
+    conv = Conversation()
+    conv.add_task("ab")   # 2
+    conv.add_final("cd")  # 2
+    assert conv.total_chars() == 4

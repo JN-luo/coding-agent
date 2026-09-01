@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 import agent.cli as cli
 from agent.config import ConfigError
+from agent.policy import ASK_DENY, ASK_ONCE, ASK_REMEMBER
 
 
 class _FakeSession:
@@ -82,7 +83,7 @@ def test_repl_submits_tasks(monkeypatch):
     assert s.submitted == ["任务1", "任务2"]
 
 
-def test_ask_prompt_mentions_task_scope(monkeypatch):
+def test_ask_prompt_for_write_file_mentions_task_scope(monkeypatch):
     prompts = []
 
     def fake_input(prompt=""):
@@ -90,8 +91,34 @@ def test_ask_prompt_mentions_task_scope(monkeypatch):
         return "y"
 
     monkeypatch.setattr(builtins, "input", fake_input)
-    assert cli._ask("write_file", {"path": "a.py"}) is True
-    assert "本任务" in prompts[0]
+    assert cli._ask("write_file", {"path": "a.py"}) == ASK_ONCE
+    assert "写入文件" in prompts[0]
+    assert "本次" in prompts[0]
+    assert "本任务内允许写文件" in prompts[0]
+
+
+def test_ask_prompt_for_run_command_mentions_exact_command(monkeypatch):
+    prompts = []
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    assert cli._ask("run_command", {"command": "pytest -q"}) == ASK_DENY
+    assert "允许执行该命令" in prompts[0]
+    assert "重复这条命令" in prompts[0]
+    assert "pytest -q" in prompts[0]
+
+
+def test_ask_can_remember_action(monkeypatch):
+    monkeypatch.setattr(builtins, "input", _fake_inputs(["a"]))
+    assert cli._ask("write_file", {"path": "a.py"}) == ASK_REMEMBER
+
+
+def test_ask_empty_input_denies(monkeypatch):
+    monkeypatch.setattr(builtins, "input", _fake_inputs([""]))
+    assert cli._ask("write_file", {"path": "a.py"}) == ASK_DENY
 
 
 def test_print_parse_error_is_friendly(capsys):

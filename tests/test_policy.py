@@ -3,7 +3,7 @@
 覆盖 DESIGN.md §3 policy.py：三模式裁决（ask / readonly / auto）与授权粒度。
 """
 
-from agent.policy import decide, grant_key
+from agent.policy import ASK_DENY, ASK_ONCE, ASK_REMEMBER, decide, grant_key, normalize_ask_choice
 
 
 def test_read_tools_always_allow():
@@ -33,3 +33,17 @@ def test_grant_key_granularity():
     assert grant_key("write_file", {"path": "a.py"}) == "write_file"
     assert grant_key("run_command", {"command": "pytest -q"}) == "run_command:pytest -q"
     assert grant_key("run_command", {"command": "pytest -q test.py"}) == "run_command:pytest -q test.py"
+
+
+def test_normalize_ask_choice():
+    assert normalize_ask_choice("y") == ASK_ONCE
+    assert normalize_ask_choice("once") == ASK_ONCE
+    assert normalize_ask_choice("a") == ASK_REMEMBER
+    assert normalize_ask_choice("remember") == ASK_REMEMBER
+    assert normalize_ask_choice("n") == ASK_DENY
+    assert normalize_ask_choice("") == ASK_DENY
+
+
+def test_normalize_ask_choice_supports_legacy_bool():
+    assert normalize_ask_choice(True) == ASK_REMEMBER
+    assert normalize_ask_choice(False) == ASK_DENY

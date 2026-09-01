@@ -17,7 +17,7 @@
 5. 工具结果回填到对话历史。
 6. Agent 判断是否继续、重试、压缩上下文或终止。
 
-**协议约定：核心版本每轮只输出一个动作**（无论只读还是写/执行），与 §3 `parser.py` 的单 action JSON schema 保持一致。只读批量作为可选增强见 §8.5，不在核心版本实现，避免出现"说了但没定义"的歧义。
+**协议约定：采用模型原生 tool calling**（见 §3 `llm.py` / `policy.py`）。每轮 LLM 响应可返回**多个 `tool_calls`**（浏览阶段批量只读，写/命令逐个裁决）；无 `tool_calls` 且带 content 时视为 final。参数校验、权限裁决、本地执行、错误回填都在本地 runtime 完成，不依赖模型端托管执行。
 
 ## 3. 模块划分
 
@@ -39,7 +39,7 @@ CLI / REPL
 
 原则：
 
-1. **单任务状态与跨任务状态分离**：parse / safety / same_tool / max_steps 每任务重置；conversation / workspace 跨任务连续；trace 只是日志。
+1. **单任务状态与跨任务状态分离**：safety / same_tool / user_denies / max_steps 每任务重置；conversation / workspace 跨任务连续；trace 只是日志。
 2. **Conversation 是唯一的活上下文**：它只负责给模型看的消息序列，不负责调度。
 3. **context 从 Conversation 取数**：新任务时从 session.conversation 构建 prompt，保留系统提示词、历史任务、工具结果与压缩摘要。
 4. **Report 是每任务输出**：Session 聚合多个 Report，但不把 Report 当作状态源。
@@ -96,39 +96,48 @@ python -m agent --max-steps 40 ...        # 覆盖单任务最大步数，便于
 
 单任务执行器（`Observe -> Think -> Act -> Observe`），由 Session 驱动。它只负责完成一个 task 的推理闭环，不保存跨任务状态。
 
-单任务状态（每任务重置）：step、连续解析失败、连续同类工具失败、安全拒绝计数、task 级授权。伪代码：
+单任务状态（每任务重置）：step、连续同类工具失败、安全拒绝、用户拒绝计数、task 级授权。伪代码：
 
 ```python
 def run_task(session, task) -> Report:
     session.trace.log("task", text=task)
+    task_grants = set()
     while step < max_steps:
         messages = context.build(session.conversation, task)
-        raw = session.llm.complete(messages)
-        session.trace.log("llm_raw", text=raw)
-        action = parser.parse(raw)
+        response = session.llm.complete(messages, tools=tools_schema)
+        session.trace.log("llm_response", n_tool_calls=len(response.tool_calls))
 
-        if action.action == "final":
-            session.trace.log("stop", reason="final")
-            return report(done=True, ...)
+        if not response.tool_calls:            # 无 tool_calls → final
+            return report(done=True, message=response.content, ...)
 
-        decision = policy.decide(session.mode, action.action)
-        if decision.deny:
-            result = ToolResult(ok=False, error="PolicyDenied", output=decision.reason)
-        elif decision.ask and policy.grant_key(action.action, action.args) not in task_grants:
-            result = (run_tool(action.action, action.args, session.workspace)
-                      if session.asker(action.action, action.args)
-                      else ToolResult(ok=False, error="UserDenied", output="用户拒绝执行该动作"))
-            if result.ok:
-                task_grants.add(policy.grant_key(action.action, action.args))
-        else:
-            result = run_tool(action.action, action.args, session.workspace)
+        session.conversation.append_assistant_tool_calls(response)
+        for tc in response.tool_calls:         # 一轮可多个工具
+            decision = policy.decide(session.mode, tc.name)
+            if tc.parse_error:                 # 参数 JSON 非法 → InvalidArgs
+                result = ToolResult(ok=False, error="InvalidArgs", output=tc.parse_error)
+            elif decision.deny:
+                result = ToolResult(ok=False, error="PolicyDenied", output=decision.reason)
+            elif decision.ask:
+                key = policy.grant_key(tc.name, tc.arguments)
+                if key not in task_grants:
+                    choice = session.asker(tc.name, tc.arguments)  # once / remember / deny
+                    if choice == "deny":
+                        result = ToolResult(ok=False, error="UserDenied", output="用户拒绝执行该动作")
+                    elif choice == "remember":
+                        task_grants.add(key)
+                        result = run_tool(tc.name, tc.arguments, session.workspace)
+                    else:  # once
+                        result = run_tool(tc.name, tc.arguments, session.workspace)
+                else:
+                    result = run_tool(tc.name, tc.arguments, session.workspace)
+            else:
+                result = run_tool(tc.name, tc.arguments, session.workspace)
 
-        session.conversation.append_turn(action.action, action.args, result)
-        session.trace.log("tool", tool=action.action, ok=result.ok, error=result.error)
+            session.conversation.append_tool_result(tc.id, tc.name, tc.arguments, result)
+            session.trace.log("tool", tool=tc.name, ok=result.ok, error=result.error)
 
-        if should_stop(...):
-            session.trace.log("stop", reason=...)
-            return report(...)
+            if should_stop(...):
+                return report(...)
 ```
 
 ### `session.py`
@@ -136,7 +145,7 @@ def run_task(session, task) -> Report:
 跨任务状态与编排的核心对象：
 
 - 持有 `Conversation`、`Trace`、`workspace`、`llm`、`reports: list[Report]`。
-- 持有 `mode`（ask / readonly / auto）与 `asker` 回调（CLI 注入的 y/n 交互询问）。
+- 持有 `mode`（ask / readonly / auto）与 `asker` 回调（CLI 注入的 once / remember / deny 交互询问）。
 - `submit(task) -> Report`：把新 task 交给 loop 跑完，然后把结果写回 conversation + trace，保存 Report。
 - 支撑 REPL：一个 session 跑到底，直到用户退出才销毁 conversation。
 
@@ -144,7 +153,7 @@ def run_task(session, task) -> Report:
 
 ### `llm.py`
 
-只封装模型调用，提供 `complete(messages) -> str`（主对话，吃 conversation 消息）与 `summarize(turns) -> str`（语义压缩，turns 由 context 从 conversation 提取）。允许使用模型厂商 API 客户端，但不依赖托管代码执行、文件工具或 agent SDK；HTTP 用标准库 `urllib`。
+只封装模型调用，提供 `complete(messages, tools) -> ModelResponse`（主对话，原生 tool calling，返回 content 或 tool_calls）与 `summarize(turns) -> str`（语义压缩，独立非 tool-calling 路径）。允许使用模型厂商 API 客户端，但不依赖托管代码执行、文件工具或 agent SDK；HTTP 用标准库 `urllib`。
 
 配置来源：
 
@@ -157,7 +166,7 @@ def run_task(session, task) -> Report:
 
 ### `parser.py`
 
-负责把 LLM 输出解析为动作。采用 JSON 输出而非模型原生 tool calling——这最大化"模型输出解析"的自研成色（题目把解析列为必须自研项），也让解析逻辑可测试、可讲解：
+已收窄为 legacy fallback：主路径改用模型原生 tool calling（LLM 直接返回结构化 `tool_calls`，参数 JSON 由 `llm` 解析），不再从文本抠 JSON。本模块保留旧 JSON 文本 action 解析（含 `test_parser.py` 的五种边界测试），仅在需要兼容不支持 tool calling 的模型时作为 fallback。
 
 ```json
 {
@@ -246,28 +255,30 @@ TOOLS: dict[str, Tool] = {}   # 注册表；喂给模型的工具说明由这里
 - `--readonly` 强制整个 session 只读：任何授权都不能升级它。
 - `--auto` 用于演示或用户明确信任：写文件与白名单命令自动执行。
 
-ask 层只在当前进程内记录授权，不做持久化、不做恢复：
+ask 层只在当前任务内记录用户选择，不做持久化、不做恢复：
 
 ```text
-y / yes     允许本任务内同类动作
+y / yes     仅允许本次动作
+a / always  允许本次动作，并在本任务内记住该授权
 n / no      拒绝本次动作（默认）
 ```
 
 - 会话级放行不在 ask 里，改用 `--auto` 启动时声明，避免中途反复确认。
-- 授权是**任务级**的（每任务重置）：换一个任务，写/跑要重新确认。
+- 记住授权是**任务级**的（每任务重置）：换一个任务，写/跑要重新确认。
+- 拒绝不会写入长期 deny 缓存，而是作为 `UserDenied` observation 回填给模型；模型可以换路径、换命令或给出无法继续的说明。
 
 授权粒度：
 
-- `write_file`：key 为 `write_file`。本任务放行一次，后续写文件都可继续。
-- `run_command`：按完整命令授权，key 为 `run_command:<command>`。`pytest -q` 与其他命令分开确认。
+- `write_file`：`remember` key 为 `write_file`。用户选择记住后，本任务内后续写文件免确认；用户选择 `once` 时只允许当前这次写入。
+- `run_command`：`remember` key 为 `run_command:<command>`，按完整命令字符串授权。即使用户选择记住，也只允许本任务内重复执行同一条命令；`pytest -q`、`pytest -q tests/test_cli.py`、`mvn test`、`mvn -q test` 都是不同授权。
 - `readonly` 模式不读取任何授权，始终禁止 `write_file` 与 `run_command`。
 
 裁决顺序：
 
-1. `parser.parse(raw, TOOLS)` 只校验 JSON 与工具名/参数形状，不负责权限。
+1. LLM 返回结构化 `tool_calls`，参数 JSON 由 `llm` 解析（非法 JSON → `parse_error` → InvalidArgs 回填）；loop 校验工具名是否存在。
 2. `policy.decide(mode, action)` 判断当前模式下是 allow、ask 还是 deny。
 3. deny：不执行工具，合成 `ToolResult(ok=False, error="PolicyDenied", output=reason)` 回填给模型。
-4. ask：若本任务已授权同类动作则直接执行；否则 CLI 询问用户 y/n，拒绝则回填 `UserDenied`。
+4. ask：若当前 task 已记住该授权则直接执行；否则 CLI 询问用户 `once / remember / deny`。`once` 只执行本次，`remember` 执行并记住到当前 task 结束，`deny` 不执行并回填 `UserDenied`。
 5. allow：再进入 `tools.run_tool`，由工具层执行路径、敏感文件、命令白名单等底线校验。
 
 这使安全边界分层清楚：prompt 负责引导，policy 负责模式权限，tools 负责底层沙箱。
@@ -281,7 +292,7 @@ n / no      拒绝本次动作（默认）
 
 上下文管理是面试重点。三层上下文 + 语义压缩，**压缩是核心自研项，不是可选增强**：
 
-1. **固定系统规则**：agent 能做什么、不能做什么、工具 JSON 格式。
+1. **固定系统规则**：agent 能做什么、不能做什么、工具 schema（由 `TOOLS` 派生，喂给模型的原生 tool calling 定义）。
 2. **工作区摘要**：项目语言、主要文件、最近读过的文件摘要——由 conversation 里的历史观察（list_files/read_file）自然体现，不单独计算。
 3. **短期轨迹**：最近 N 轮 action/result 原文。
 
@@ -291,67 +302,58 @@ n / no      拒绝本次动作（默认）
 
 ### `messages.py`
 
-conversation 核心，三件套：`Message(role, content)` + `Turn(action, args, result)` + `Conversation`。`Conversation` 同时持有 `messages`（发给模型的序列）与 `turns`（结构化轨迹，供 context 压缩），是**活上下文**，跨任务累积，不落盘、不恢复。
+conversation 核心，三件套：`Message(role, content, tool_calls, tool_call_id, name)` + `Turn(action, args, result)` + `Conversation`。`Conversation` 同时持有 `messages`（发给模型的序列，支持原生 tool calling 结构）与 `turns`（结构化轨迹，供 context 压缩），是**活上下文**，跨任务累积，不落盘、不恢复。
+
+消息角色：
 
 - `system`：固定规则 + 工具 schema（由 `prompts.py` 构建，进程开头写一次）。
-- `user`：每轮任务（每个 task 一条）+ 每轮的观察结果。
-- `assistant`：模型当轮动作的 canonical JSON（由 parsed action 重渲染，丢 thought）。
+- `user`：每轮任务（每个 task 一条）。
+- `assistant`：模型当轮的 `tool_calls`（或 final 的纯文本 content）。
+- `tool`：单个工具的执行结果（带 `tool_call_id` 与 `name`）。
 
-接口：`set_system(rules)`、`add_task(text)`、`append_turn(action, args, result)`（追加 assistant 动作 + user 观察 + 一条 Turn，保证交替）、`add_final(message)`（追加 final 结论，供下个任务参考）、`as_openai()`、`total_chars()`。观察 JSON 对齐 §6——成功 `{"tool", "ok", "output"}`、失败 `{"tool", "ok", "error_type", "message"}`。
+接口：`set_system(rules)`、`add_task(text)`、`append_assistant_tool_calls(response)`（追加 assistant 的 tool_calls 消息，保留 raw arguments 与 reasoning_content）、`append_tool_result(tool_call_id, name, args, result)`（追加 tool 结果消息 + 一条 Turn）、`add_final(content)`（追加 final 结论）、`as_openai()`、`total_chars()`。工具结果正文对齐 §6——成功 `{"tool", "ok", "output"}`、失败 `{"tool", "ok", "error_type", "message"}`。
 
 ### `trace.py`
 
 落盘的调试日志，只做观察，不参与控制流：
 
 - 每行一个事件，`flush()` 每行，崩溃时尽量保住已写行。
-- 关键事件：`llm_raw`、`action`、`parse_error`、`tool`、`stop`、`task`。
+- 关键事件：`task`、`llm_response`（n_tool_calls）、`tool`（ok / error / output_len / output_preview）、`summarize_error`、`stop`。失败工具的 output 记录截断后的正文（前 1000 字符），避免只看 output_len 无法定位失败原因。
 - 文件按 session 命名 `run-<时间戳>.jsonl`，目录由 `CODING_AGENT_TRACE_DIR` 配置（默认 `trace/`），加入 `.gitignore`。
 - 只做 append-only 日志，不做 replay / resume / 恢复。
 
 ## 4. 推荐的 Prompt 协议
 
-系统提示词（`prompts.py` 生成，工具列表与 schema 由代码生成）：
+系统提示词（`prompts.py` 生成规则；工具定义不再手写进 prompt，而是通过请求的 `tools` + `tool_choice` 参数传给模型）：
 
 ```text
 你是一个本地 coding agent，在 workspace 目录内观察、修改代码，并运行测试验证。
-
-【输出格式】每次回复必须且只能是一个 JSON 对象，不要输出任何其他文字或 Markdown：
-  - 调用工具：{"thought": "简短说明", "action": "工具名", "args": {...}}
-  - 完成任务：{"action": "final", "message": "总结"}
-action 只能是「可用工具」之一，或 final。
-
-【工具结果】工具执行后回填一个 JSON 观察结果，含 ok 字段：
-  - ok=true 时看 output；
-  - ok=false 时看 error_type 与 message，据此换路径 / 改命令 / 重试，不要原样重来。
+使用提供的工具（tool calling）观察和修改仓库；信息不足时先 read_file / list_files / glob / grep。
 
 【路径】所有 path 都相对 workspace 根目录，不能访问 workspace 之外。
 
 【原则】
-  - 不要编造文件内容；需要信息时先 read_file / grep / glob。
+  - 不要编造文件内容；需要信息时先搜索。
   - 写文件前尽量先读取目标文件。
   - 执行命令失败时先分析 stderr。
-  - 任务完成后用 final 收尾，不要无限循环。
-
-【示例】
-  调用工具：{"thought": "先看看项目结构", "action": "list_files", "args": {"path": "."}}
-  完成任务：{"action": "final", "message": "已修复测试失败。"}
+  - 任务完成后停止调用工具，直接给出最终回答。
 ```
 
-工具列表与 schema 由代码生成（`prompts.py` 的 `build_system_prompt` 从 `TOOLS` 派生），避免实现和说明不一致。
+工具 schema 由代码生成（`Tool.to_schema()` 从 `TOOLS` 派生，随请求传入），避免实现和说明不一致。
 
 ## 5. 循环终止条件
 
 以下终止条件都是**单任务内**的（每任务重置；Session 跨任务存在）：
 
-- `final` 动作：模型主动完成。
+- `final`：模型不再调用工具、返回纯文本回答。
 - `max_steps`：默认 50 步，可由 CLI 的 `--max-steps` 覆盖。
-- 连续解析失败：例如 3 次。
 - 连续同类工具失败：例如同一命令失败 3 次。
-- 安全拒绝：模型多次请求越权路径或危险命令。
+- 安全拒绝：模型多次请求越权路径或危险命令（PolicyDenied / PathOutsideWorkspace）。
+- 用户拒绝：用户拒绝会先回填 `UserDenied` 让模型自我修正；若连续拒绝 3 次、累计拒绝 5 次，或同类高风险动作（`write_file` / `run_command`）被拒绝 3 次，则提前停止。
 
 终止时输出简洁报告：
 
-- 终止原因（`stop_reason`：final / max_steps / parse_failures / same_tool_failures / safety_rejections / llm_error）
+- 终止原因（`stop_reason`：final / max_steps / same_tool_failures / safety_rejections / user_denied / llm_error）
 - 做了什么
 - 修改了哪些文件
 - 是否运行测试
@@ -379,12 +381,12 @@ action 只能是「可用工具」之一，或 final。
 
 1. CLI/REPL 接收任务。
 2. `Session` 维持一个长期 `Conversation`。
-3. LLM 返回 JSON 动作。
+3. LLM 通过原生 tool calling 返回结构化 `tool_calls`（一轮可多个）。
 4. 支持 `list_files`、`read_file`、`glob`、`grep`、`write_file`、`run_command`（6 个）。
 5. 路径限制在 workspace 内（含 Windows 兼容）。
-6. 每个 task 最多运行 20 步。
+6. 每个 task 最多运行 50 步（可 `--max-steps` 覆盖）。
 7. 历史超阈值触发语义压缩（§3 三层上下文 + summarizer）。
-8. 模式 + ask 层：`read_only / edit / auto`，edit 下高风险动作询问用户。
+8. 模式 + ask 层：`ask / readonly / auto`，ask 下写/命令询问用户。
 9. 危险命令直接拒绝并回填错误。
 10. 每个 task 输出一份 Report，REPL 继续等下一条任务。
 
@@ -396,7 +398,6 @@ action 只能是「可用工具」之一，或 final。
 
 1. **Dry run 模式**：只展示计划和将要调用的工具，不真正写文件。
 2. **apply_patch 差异修改（可选，慎做）**：模型输出 unified diff，runtime 校验后应用。unified diff 的模糊匹配、行号漂移是已知工程坑；若做，建议用成熟 diff 库（如 `unidiff`，非 agent SDK，合规），并放到最后，避免卡进度。
-3. **只读批量**：一轮输出 `{"action": "batch", "actions": [{...}, {...}]}`，只允许低风险只读工具，用于列目录 + 读多文件提速。
 
 ## 9. 演示任务建议
 

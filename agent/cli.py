@@ -7,6 +7,7 @@ from pathlib import Path
 from agent.config import ConfigError, load_config
 from agent.llm import LLM, LLMError
 from agent.loop import MAX_STEPS, render_report
+from agent.policy import ASK_DENY, ASK_ONCE, ASK_REMEMBER
 from agent.prompts import build_system_prompt
 from agent.session import Session
 from agent.tools import TOOLS
@@ -29,7 +30,10 @@ def _print_step(kind: str, **fields) -> None:
         args = fields.get("args", {})
         args_str = ", ".join(f"{k}={_short(_flat(str(v)), 40)}" for k, v in args.items())
         label = f"{fields['action']}({args_str})" if args_str else fields["action"]
-        print(f"  [{fields['step']}] -> {label}", flush=True)
+        step_label = str(fields["step"])
+        if fields.get("substep") is not None:
+            step_label = f"{step_label}.{fields['substep']}"
+        print(f"  [{step_label}] -> {label}", flush=True)
     elif kind == "parse_error":
         print(f"  [{fields['step']}] parse_error: 模型输出不是合法动作，已要求重试", flush=True)
     elif kind == "tool":
@@ -45,11 +49,21 @@ def _print_step(kind: str, **fields) -> None:
                 print("    " + _short(out, 200).replace("\n", "\n    "), flush=True)
 
 
-def _ask(action: str, args: dict) -> bool:
+def _ask(action: str, args: dict) -> str:
     args_str = ", ".join(f"{k}={_short(_flat(str(v)), 40)}" for k, v in args.items())
     label = f"{action}({args_str})" if args_str else action
-    answer = input(f"  允许本任务内继续执行同类动作 {label} 吗？[y/N] ").strip().lower()
-    return answer in ("y", "yes")
+    if action == "write_file":
+        prompt = f"  允许写入文件吗？{label} [y=本次/a=本任务内允许写文件/N=拒绝] "
+    elif action == "run_command":
+        prompt = f"  允许执行该命令吗？{label} [y=本次/a=本任务内允许重复这条命令/N=拒绝] "
+    else:
+        prompt = f"  允许执行该动作吗？{label} [y=本次/a=本任务内记住/N=拒绝] "
+    answer = input(prompt).strip().lower()
+    if answer in ("y", "yes"):
+        return ASK_ONCE
+    if answer in ("a", "always", "remember"):
+        return ASK_REMEMBER
+    return ASK_DENY
 
 
 def main(argv=None) -> int:

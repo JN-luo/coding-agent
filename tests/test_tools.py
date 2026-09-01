@@ -43,10 +43,38 @@ def test_each_tool_has_schema():
         assert isinstance(tool.parameters, dict), f"{tool.name} 缺 parameters"
 
 
+def test_tool_to_schema():
+    schema = TOOLS["read_file"].to_schema()
+    assert schema["type"] == "function"
+    assert schema["function"]["name"] == "read_file"
+    assert schema["function"]["parameters"]["required"] == ["path"]
+
+
 def test_run_unknown_tool(tmp_path):
     result = run_tool("nonexistent", {}, tmp_path)
     assert result.ok is False
     assert result.error == "UnknownTool"
+
+
+def test_run_tool_rejects_missing_required_arg(tmp_path):
+    result = run_tool("read_file", {}, tmp_path)
+    assert result.ok is False
+    assert result.error == "InvalidArgs"
+    assert "缺少必要参数" in result.output
+
+
+def test_run_tool_rejects_unknown_arg(tmp_path):
+    result = run_tool("list_files", {"path": ".", "extra": "x"}, tmp_path)
+    assert result.ok is False
+    assert result.error == "InvalidArgs"
+    assert "未知参数" in result.output
+
+
+def test_run_tool_rejects_wrong_arg_type(tmp_path):
+    result = run_tool("read_file", {"path": 123}, tmp_path)
+    assert result.ok is False
+    assert result.error == "InvalidArgs"
+    assert "类型错误" in result.output
 
 
 # ---- 路径安全 ----
@@ -325,6 +353,16 @@ def test_policy_allows_pytest():
 def test_policy_allows_maven_test():
     assert check_command_policy("mvn test") == "allow"
     assert check_command_policy("mvn -q test") == "allow"
+    assert check_command_policy("mvn -q clean test") == "allow"
+    assert check_command_policy("mvn test -DskipTests=false") == "allow"
+    assert check_command_policy("mvn -q test -Dtest=FileSystemIFINDTest,FileSystemIntegrationTest -DfailIfNoTests=false") == "allow"
+
+
+def test_policy_denies_non_test_maven_commands():
+    assert check_command_policy("mvn package") == "deny"
+    assert check_command_policy("mvn install") == "deny"
+    assert check_command_policy("mvn clean package") == "deny"
+    assert check_command_policy("mvn test -Dtest=FileSystemIFINDTest;rm") == "deny"
 
 
 def test_policy_denies_unknown():
@@ -404,3 +442,9 @@ def test_run_command_truncates(tmp_path, monkeypatch):
     assert result.ok is True
     assert len(result.output) < 100
     assert "截断" in result.output
+
+
+def test_run_command_success_without_output_is_explicit(tmp_path):
+    result = run_tool("run_command", {"command": "python -c \"pass\""}, tmp_path)
+    assert result.ok is True
+    assert result.output == "命令执行成功，无输出。"

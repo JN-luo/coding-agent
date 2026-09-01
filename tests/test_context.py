@@ -5,6 +5,8 @@
   - summarize 的语义压缩接入点（由上层提供 summarizer）
 """
 
+import json
+
 from agent.context import RECENT_TURNS, build, summarize
 from agent.messages import Conversation, Turn
 from agent.tools import ToolResult
@@ -18,12 +20,28 @@ def fake_summarizer(turns):
     return " | ".join(f"{t.action}:{t.result.error or 'done'}" for t in turns)
 
 
+class _TC:
+    def __init__(self, id, name, arguments):
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+        self.raw_arguments = json.dumps(arguments, ensure_ascii=False)
+        self.parse_error = ""
+
+
+class _Response:
+    def __init__(self, tool_calls, reasoning_content=None):
+        self.tool_calls = tool_calls
+        self.reasoning_content = reasoning_content
+
+
 def make_conversation(turns=(), task="task", system="rules"):
     conv = Conversation()
     conv.set_system(system)
     conv.add_task(task)
-    for t in turns:
-        conv.append_turn(t.action, t.args, t.result)
+    for i, t in enumerate(turns):
+        conv.append_assistant_tool_calls(_Response([_TC(f"call_{i}", t.action, t.args)], reasoning_content=f"think-{i}"))
+        conv.append_tool_result(f"call_{i}", t.action, t.args, t.result)
     return conv
 
 
@@ -35,7 +53,8 @@ def test_build_under_threshold_returns_conversation():
     assert msgs[0] == {"role": "system", "content": "rules"}
     assert msgs[1] == {"role": "user", "content": "task"}
     assert msgs[2]["role"] == "assistant"
-    assert msgs[3]["role"] == "user"
+    assert "tool_calls" in msgs[2]
+    assert msgs[3]["role"] == "tool"
 
 
 def test_build_over_threshold_compresses():
@@ -45,10 +64,10 @@ def test_build_over_threshold_compresses():
         turn("grep", {"pattern": "foo"}),
     ])
     msgs = build(conv, recent_turns=1, max_chars=10, summarize_fn=fake_summarizer)
-    contents = [m["content"] for m in msgs]
-    assert any("摘要" in c for c in contents)             # 摘要出现
-    assert any('"action": "grep"' in c for c in contents)  # 最近 1 轮保留
-    assert not any('"action": "list_files"' in c for c in contents)  # 旧轮被取代
+    assert any("摘要" in (m.get("content") or "") for m in msgs)  # 摘要出现
+    # 最近 1 轮（grep）保留为 tool_calls；旧轮（list_files）被取代
+    names = [m["tool_calls"][0]["function"]["name"] for m in msgs if m.get("tool_calls")]
+    assert names == ["grep"]
 
 
 def test_build_over_threshold_order():
@@ -58,13 +77,15 @@ def test_build_over_threshold_order():
         turn("grep", {"pattern": "foo"}),
     ], task="当前任务")
     msgs = build(conv, recent_turns=1, max_chars=10, summarize_fn=fake_summarizer)
-    # 顺序：system -> 摘要 -> 当前任务 -> 最近一轮(assistant + observation)
+    # 顺序：system -> 摘要 -> 当前任务 -> 最近一轮(assistant tool_calls + tool 结果)
     assert msgs[0]["role"] == "system"
     assert "摘要" in msgs[1]["content"]
     assert msgs[2] == {"role": "user", "content": "当前任务"}
     assert msgs[3]["role"] == "assistant"
-    assert msgs[4]["role"] == "user"  # 最后一条是 observation，不是任务
-    assert msgs[-1]["content"] != "当前任务"
+    assert "tool_calls" in msgs[3]
+    assert msgs[4]["role"] == "tool"
+    assert msgs[4]["name"] == "grep"
+    assert msgs[3]["reasoning_content"] == "think-2"
 
 
 # ---- summarize ----

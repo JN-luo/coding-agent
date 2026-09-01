@@ -7,26 +7,24 @@
 
 import json
 
+from agent.llm import ModelResponse, ModelToolCall
 from agent.session import Session
 from agent.tools import ToolResult
 
 
 def j(action, args=None):
-    d = {"action": action}
-    if args is not None:
-        d["args"] = args
-    return json.dumps(d)
+    return ModelResponse(tool_calls=[ModelToolCall(id="call_1", name=action, arguments=args or {})])
 
 
 def jfinal(msg="done"):
-    return json.dumps({"action": "final", "message": msg})
+    return ModelResponse(content=msg)
 
 
 class FakeLLM:
     def __init__(self, responses):
         self.responses = list(responses)
 
-    def complete(self, messages):
+    def complete(self, messages, tools=None):
         if len(self.responses) > 1:
             return self.responses.pop(0)
         return self.responses[0]

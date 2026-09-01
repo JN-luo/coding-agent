@@ -14,4 +14,6 @@ def test_build_system_prompt_derives_all_tools():
         assert name in prompt
         assert tool.description in prompt
     assert "可用工具：" in prompt
-    assert "、final" in prompt
+    assert "tool_calls" in prompt
+    assert "手写 JSON 动作" in prompt
+    assert "Act, don't narrate" not in prompt

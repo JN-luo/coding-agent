@@ -8,6 +8,7 @@
 """
 
 import json
+import socket
 import urllib.error
 
 import pytest
@@ -17,6 +18,7 @@ from agent.messages import Turn
 from agent.llm import (
     LLM,
     LLMError,
+    _parse_tool_call,
     _render_turn,
     build_summarize_messages,
 )
@@ -47,6 +49,15 @@ class FakeResponse:
         return json.dumps(self._payload).encode("utf-8")
 
 
+class FakeHTTPError(urllib.error.HTTPError):
+    def __init__(self, payload):
+        super().__init__("http://x/v1/chat/completions", 400, "Bad Request", hdrs=None, fp=None)
+        self._payload = payload
+
+    def read(self):
+        return self._payload.encode("utf-8")
+
+
 def make_urlopen(content, captured=None):
     def fake(req, timeout=None):
         if captured is not None:
@@ -63,7 +74,57 @@ def make_urlopen(content, captured=None):
 
 def test_complete_returns_content():
     llm = LLM(config(), urlopen=make_urlopen('{"action": "final"}'))
-    assert llm.complete([{"role": "user", "content": "hi"}]) == '{"action": "final"}'
+    resp = llm.complete([{"role": "user", "content": "hi"}])
+    assert resp.content == '{"action": "final"}'
+    assert resp.tool_calls == []
+
+
+def test_complete_parses_tool_calls():
+    payload = {
+        "choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": '{"path": "."}'}}
+        ]}}]
+    }
+    llm = LLM(config(), urlopen=lambda req, timeout=None: FakeResponse(payload))
+    resp = llm.complete([{"role": "user", "content": "hi"}], tools=[{"type": "function", "function": {"name": "list_files"}}])
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "list_files"
+    assert resp.tool_calls[0].arguments == {"path": "."}
+
+
+def test_complete_preserves_reasoning_content():
+    payload = {
+        "choices": [{"message": {
+            "content": None,
+            "reasoning_content": "hidden chain",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": '{"path": "."}'}}
+            ],
+        }}]
+    }
+    llm = LLM(config(), urlopen=lambda req, timeout=None: FakeResponse(payload))
+    resp = llm.complete([{"role": "user", "content": "hi"}])
+    assert resp.reasoning_content == "hidden chain"
+
+
+def test_parse_tool_call_keeps_argument_parse_error():
+    tc = _parse_tool_call({
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":'},
+    })
+    assert tc.arguments == {}
+    assert tc.raw_arguments == '{"path":'
+    assert "不是合法 JSON" in tc.parse_error
+
+
+def test_complete_sends_tools():
+    captured = {}
+    llm = LLM(config(), urlopen=make_urlopen("ok", captured))
+    tools = [{"type": "function", "function": {"name": "list_files", "parameters": {}}}]
+    llm.complete([{"role": "user", "content": "hi"}], tools=tools)
+    assert captured["body"]["tools"] == tools
+    assert captured["body"]["tool_choice"] == "auto"
 
 
 def test_complete_builds_request():
@@ -123,6 +184,37 @@ def test_http_error_raises():
     llm = LLM(config(), urlopen=boom)
     with pytest.raises(LLMError):
         llm.complete([{"role": "user", "content": "hi"}])
+
+
+def test_http_error_includes_response_body():
+    def boom(req, timeout=None):
+        raise FakeHTTPError('{"error":{"message":"messages with role tool must include name"}}')
+
+    llm = LLM(config(), urlopen=boom)
+    with pytest.raises(LLMError) as exc:
+        llm.complete([{"role": "user", "content": "hi"}])
+    assert "HTTP Error 400" in str(exc.value)
+    assert "messages with role tool" in str(exc.value)
+
+
+def test_timeout_error_raises_llmerror():
+    def boom(req, timeout=None):
+        raise TimeoutError("timed out")
+
+    llm = LLM(config(), urlopen=boom)
+    with pytest.raises(LLMError) as exc:
+        llm.complete([{"role": "user", "content": "hi"}])
+    assert "超时" in str(exc.value)
+
+
+def test_socket_timeout_error_raises_llmerror():
+    def boom(req, timeout=None):
+        raise socket.timeout("timed out")
+
+    llm = LLM(config(), urlopen=boom)
+    with pytest.raises(LLMError) as exc:
+        llm.complete([{"role": "user", "content": "hi"}])
+    assert "超时" in str(exc.value)
 
 
 def test_malformed_response_raises():

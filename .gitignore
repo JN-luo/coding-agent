@@ -8,6 +8,7 @@ trace/
 demo/
 face-checkin-backend/
 .claude/
+scripts/
 
 # Python
 __pycache__/
@@ -15,3 +16,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 .pytest_tmp/
+
+mini-memory-filesystem/
+mini-memory-filesystem copy/
